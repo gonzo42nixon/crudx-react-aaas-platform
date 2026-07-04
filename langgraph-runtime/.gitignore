@@ -1,0 +1,10 @@
+
+# Dependencies
+node_modules/
+
+# Local secrets
+.env
+.env.local
+
+# LangGraph API state
+.langgraph_api/

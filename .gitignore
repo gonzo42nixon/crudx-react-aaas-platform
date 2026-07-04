@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Local secrets
+.env
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Generated state
+**/.langgraph_api/
+
+# Logs
+firebase-debug.log
+firebase-debug.*.log
+npm-debug.log*
+

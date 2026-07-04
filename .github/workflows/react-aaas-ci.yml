@@ -1,0 +1,38 @@
+name: ReAct AaaS CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate runtime and middleware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install LangGraph runtime dependencies
+        working-directory: langgraph-runtime
+        run: npm ci
+
+      - name: Lint LangGraph runtime
+        working-directory: langgraph-runtime
+        run: npm run lint
+
+      - name: Install GCF middleware dependencies
+        working-directory: gcf-middleware/functions
+        run: npm ci
+
+      - name: Lint GCF middleware
+        working-directory: gcf-middleware/functions
+        run: npm run lint

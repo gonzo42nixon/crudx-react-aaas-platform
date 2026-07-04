@@ -1,0 +1,40 @@
+{
+  "assistant_id": "agent",
+  "input": {
+    "okfEnvelope": {
+      "okf_key": "CRUDX-5432U-D58X8-52X8U",
+      "agent_id": "alice-hr",
+      "meta": {
+        "name": "Alice (HR Assistant)",
+        "version": "1",
+        "tags": ["hr", "onboarding", "production"]
+      },
+      "okf": {
+        "system_prompt": "You are Alice, a professional HR Assistant. Reply in English.",
+        "llm": {
+          "provider": "gemini",
+          "model": "gemini-3.5-flash",
+          "temperature": 0.2
+        },
+        "allowed_tools": [
+          {
+            "name": "search_knowledge_base",
+            "description": "Search HR knowledge.",
+            "type": "webhook"
+          },
+          {
+            "name": "calculate_days",
+            "description": "Calculates business days.",
+            "type": "webhook"
+          }
+        ],
+        "mcp_endpoints": ["mcp://react-agent/v1"]
+      },
+      "knowledge": "Employees have 30 vacation days per year. Max Mustermann has 18 remaining vacation days. Vacation requests must be filed 2 weeks in advance."
+    },
+    "okfKey": "CRUDX-5432U-D58X8-52X8U",
+    "input": "Max Mustermann wants vacation from 2026-08-03 to 2026-08-14. Check balance, policy, and calendar impact.",
+    "messages": [],
+    "dryRun": true
+  }
+}

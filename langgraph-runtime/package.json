@@ -1,0 +1,21 @@
+{
+  "name": "crudx-react-aaas-langgraph-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "External LangGraph runtime for CRUDX ReAct Agent-as-a-Service.",
+  "main": "src/server.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "node scripts/check-syntax.js",
+    "graph:dev": "langgraph dev",
+    "graph:deploy": "langgraph deploy"
+  },
+  "dependencies": {
+    "@langchain/langgraph": "^1.4.7",
+    "langsmith": "^0.7.15"
+  }
+}

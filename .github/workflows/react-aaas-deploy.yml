@@ -1,0 +1,84 @@
+name: Deploy ReAct AaaS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "langgraph-runtime/**"
+      - "gcf-middleware/**"
+      - ".github/workflows/react-aaas-deploy.yml"
+
+env:
+  GCP_PROJECT_ID: crudx-e0599
+  GCP_REGION: europe-west3
+  CLOUD_RUN_SERVICE: react-aaas-langgraph-runtime
+  LANGSMITH_ENDPOINT: https://api.smith.langchain.com
+  LANGSMITH_PROJECT: react-aaas-crudx
+  LANGSMITH_WORKSPACE_ID: 55357b07-4341-486e-b7f0-1cbb274d6e2e
+
+jobs:
+  deploy:
+    name: Deploy Cloud Run runtime and GCF middleware
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install LangGraph runtime dependencies
+        working-directory: langgraph-runtime
+        run: npm ci
+
+      - name: Validate LangGraph runtime
+        working-directory: langgraph-runtime
+        run: npm run lint
+
+      - name: Deploy LangGraph runtime to Cloud Run
+        working-directory: langgraph-runtime
+        run: |
+          gcloud run deploy "$CLOUD_RUN_SERVICE" \
+            --source . \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --allow-unauthenticated \
+            --set-env-vars "GEMINI_MODEL=gemini-3.5-flash,LANGSMITH_ENDPOINT=$LANGSMITH_ENDPOINT,LANGSMITH_PROJECT=$LANGSMITH_PROJECT,LANGSMITH_WORKSPACE_ID=$LANGSMITH_WORKSPACE_ID" \
+            --set-secrets "GEMINI_API_KEY=GEMINI_API_KEY:latest,LANGSMITH_API_KEY=LANGSMITH_API_KEY:latest,LANGGRAPH_RUNTIME_TOKEN=LANGGRAPH_RUNTIME_TOKEN:latest" \
+            --quiet
+
+      - name: Resolve Cloud Run URL
+        run: |
+          SERVICE_URL="$(gcloud run services describe "$CLOUD_RUN_SERVICE" --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
+          echo "CLOUD_RUN_URL=$SERVICE_URL" >> "$GITHUB_ENV"
+
+      - name: Install GCF middleware dependencies
+        working-directory: gcf-middleware/functions
+        run: npm ci
+
+      - name: Validate GCF middleware
+        working-directory: gcf-middleware/functions
+        run: npm run lint
+
+      - name: Deploy GCF middleware
+        working-directory: gcf-middleware
+        run: npx firebase-tools deploy --only functions:react-aaas:reactAaasInvoke --project "$GCP_PROJECT_ID" --non-interactive
+
+      - name: Smoke test health endpoint
+        run: curl --fail --silent "$CLOUD_RUN_URL/health"

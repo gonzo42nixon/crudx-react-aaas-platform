@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Local secret overrides
+.env
+.env.local
+
+# Firebase logs
+firebase-debug.log
+firebase-debug.*.log
