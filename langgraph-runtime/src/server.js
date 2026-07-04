@@ -525,22 +525,31 @@ function buildGraphObservation(input, agent, action) {
   const knowledge = String(agent?.knowledge || "");
   const text = String(input || "").toLowerCase();
   if (action === "none") return "No configured tool was selected; answer from OKF context and prior conversation.";
-  if (/calculate|days/i.test(action) || /2026-08-03|2026-08-14|business-day|business day/.test(text)) {
-    return "Calculated business-day impact for 2026-08-03 to 2026-08-14 is 10 business days, assuming Monday through Friday and no holiday calendar overrides.";
+  const dates = extractIsoDates(input);
+  if (/calculate|days/i.test(action) || dates.length >= 2 || /business-day|business day/.test(text)) {
+    if (dates.length >= 2) {
+      const days = countWeekdays(dates[0], dates[1]);
+      return `Calculated business-day impact for ${dates[0]} to ${dates[1]} is ${days} business days, assuming Monday through Friday and no holiday calendar overrides.`;
+    }
+    return "Date calculation requested, but no exact start and end dates were supplied in the current turn.";
   }
-  if (/search|knowledge/i.test(action) && /max|mustermann|vacation|urlaub/.test(text)) {
-    return knowledge.includes("18 remaining vacation days")
-      ? "OKF knowledge lookup: Max Mustermann has 18 remaining vacation days after taking 12 from a 30 day entitlement. Vacation requests must be filed 2 weeks in advance."
-      : "OKF knowledge lookup: annual entitlement is 30 vacation days and requests must be filed 2 weeks in advance.";
+  if (/search|knowledge/i.test(action)) {
+    const snippets = selectKnowledgeSnippets(input, knowledge);
+    return snippets.length
+      ? `OKF knowledge lookup: ${snippets.join(" ")}`
+      : "OKF knowledge lookup: no directly matching knowledge snippet was found in the OKF document.";
   }
   return "Configured tool selected from OKF. Observation is grounded in available OKF knowledge; missing external tool execution is explicitly noted.";
 }
 
 function buildAgentReflection(state) {
+  const hasDates = extractIsoDates(state.input || "").length >= 2;
+  const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
   return [
-    "The first observation gives a useful starting point, but it is not enough for an HR-quality recommendation.",
-    "I still need to separate entitlement/balance facts from policy constraints and calendar impact.",
-    `Current action was ${state.action || "none"}; the next useful move is a policy-oriented lookup followed by a date calculation check.`
+    "The first observation should be combined with OKF policy knowledge before answering.",
+    hasDates ? "The request includes exact dates, so calendar impact can be checked." : "No complete date range was supplied, so date impact may need clarification.",
+    hasKnowledge ? "The OKF knowledge base is available for factual grounding." : "No OKF knowledge text is available, so the answer must state that limitation.",
+    `Current action was ${state.action || "none"}.`
   ].join(" ");
 }
 
@@ -553,17 +562,18 @@ function buildInternalFollowupQuestion(state) {
 
 function buildPolicyObservation(input, agent) {
   const knowledge = String(agent?.knowledge || "");
-  if (/vacation|urlaub|approval|approve|request/i.test(input) || /vacation days/i.test(knowledge)) {
-    return knowledge.includes("2 weeks")
-      ? "Policy check: employees are entitled to 30 vacation days per year, and vacation requests must be filed at least 2 weeks in advance."
-      : "Policy check: entitlement information exists in OKF, but the advance-notice rule is not explicit.";
+  const snippets = selectKnowledgeSnippets(input, knowledge, [/policy|rule|request|approval|approve|vacation|urlaub|entitled|advance|weeks|days/i]);
+  if (snippets.length) {
+    return `Policy check from OKF: ${snippets.join(" ")}`;
   }
   return "Policy check: no specific HR policy rule was found for this request in the OKF knowledge.";
 }
 
 function buildCalendarObservation(input) {
-  if (/2026-08-03|2026-08-14|business-day|business day|10 vacation/i.test(input)) {
-    return "Calendar check: 2026-08-03 through 2026-08-14 spans 10 weekday business days when weekends are excluded and no holiday override is applied.";
+  const dates = extractIsoDates(input);
+  if (dates.length >= 2) {
+    const days = countWeekdays(dates[0], dates[1]);
+    return `Calendar check: ${dates[0]} through ${dates[1]} spans ${days} weekday business days when weekends are excluded and no holiday override is applied.`;
   }
   if (/next month|period|date|days/i.test(input)) {
     return "Calendar check: no exact start and end dates were supplied in the current turn, so the executor cannot verify the business-day count yet.";
@@ -586,10 +596,12 @@ function buildGraphFinalPrompt(state) {
     state.agent.okf.system_prompt,
     "",
     "You are the final response node in a multi-step LangGraph ReAct executor.",
-    "Use the supplied graph state. Do not output JSON or Markdown code fences.",
-    "Do not expose hidden chain-of-thought. Keep Plan short and operational.",
-    "Return exactly these sections: Plan, Dialogue, Evidence, Final.",
-    "The Dialogue section should summarize the visible ReAct back-and-forth in 3 to 5 concise bullet-style lines.",
+    "Use the supplied graph state, OKF knowledge, and prior conversation.",
+    "Return only the final user-facing answer.",
+    "Do not output JSON, Markdown code fences, raw graph state, trace data, or hidden chain-of-thought.",
+    "Do not use headings named Plan, Dialogue, Evidence, or Final.",
+    "Write like a helpful professional assistant speaking to the user.",
+    "Mention missing information only when it materially affects the answer.",
     "",
     "Graph state:",
     `Context review: ${state.contextReview || "none"}`,
@@ -613,43 +625,89 @@ function buildGraphFinalPrompt(state) {
     "Final response requirements:",
     "- Use prior conversation when relevant.",
     "- Separate known facts from missing information.",
-    "- If a tool result is simulated from OKF knowledge, say it is based on OKF context.",
-    "- Make the answer feel like a short professional dialogue report, not a raw JSON trace.",
-    "- Keep the final answer user-facing and practical."
+    "- If facts come from OKF, simply say they are in the OKF context when useful.",
+    "- Keep the final answer concise, practical, and readable.",
+    "- Do not reveal internal node names unless the user explicitly asks for debugging."
   ].join("\n");
 }
 
 function normalizeGraphFinalAnswer(text, state) {
   const raw = String(text || "").trim();
+  const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
   const looksIncomplete = !raw
-    || !/Final\s*:/i.test(raw)
     || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(raw);
-  return looksIncomplete ? buildDeterministicGraphSections(state) : raw;
+  const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
+    || /LangGraph Node|Graph state|tool_observation|agent_reflection/i.test(withoutFences);
+  return looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
+}
+
+function looksLikeJson(text) {
+  const trimmed = String(text || "").trim();
+  if (!/^[\[{]/.test(trimmed)) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function extractIsoDates(input) {
+  return Array.from(String(input || "").matchAll(/\b(20\d{2}-\d{2}-\d{2})\b/g))
+    .map((match) => match[1])
+    .filter((value, index, all) => all.indexOf(value) === index);
+}
+
+function countWeekdays(startIso, endIso) {
+  const start = parseIsoDate(startIso);
+  const end = parseIsoDate(endIso);
+  if (!start || !end) return 0;
+  const direction = start <= end ? 1 : -1;
+  let cursor = new Date(start);
+  let count = 0;
+  while ((direction === 1 && cursor <= end) || (direction === -1 && cursor >= end)) {
+    const day = cursor.getUTCDay();
+    if (day !== 0 && day !== 6) count += 1;
+    cursor.setUTCDate(cursor.getUTCDate() + direction);
+  }
+  return count;
+}
+
+function parseIsoDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function selectKnowledgeSnippets(input, knowledge, extraPatterns = []) {
+  const text = String(input || "").toLowerCase();
+  const terms = Array.from(new Set(text.match(/[a-zäöüß0-9]{4,}/gi) || []))
+    .map((term) => term.toLowerCase());
+  const patterns = extraPatterns.length ? extraPatterns : terms.map((term) => new RegExp(escapeRegex(term), "i"));
+  return String(knowledge || "")
+    .split(/\n+|(?<=\.)\s+/)
+    .map((line) => line.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean)
+    .filter((line) => patterns.some((pattern) => pattern.test(line)))
+    .slice(0, 5);
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
-  let final = "Based on the OKF context, the request can be answered from the available facts. Missing external information should be confirmed before operational execution.";
-  if (/max|mustermann|vacation|urlaub|2026-08-03|2026-08-14/i.test(String(state.input || ""))) {
-    final = "Max Mustermann's requested period from 2026-08-03 to 2026-08-14 is treated as 10 business days. The OKF context says he has 18 remaining vacation days, so the balance is sufficient and would leave 8 days after approval. HR should still confirm the formal request record, manager approval, and any coverage requirements before final booking.";
+  const policy = String(state.policyObservation || "");
+  const calendar = String(state.calendarObservation || "");
+  const snippets = [observation, policy, calendar]
+    .filter((part) => part && !/^No observation available/i.test(part) && !/^Policy check: no/i.test(part) && !/^Calendar check: no/i.test(part));
+  if (!snippets.length) {
+    return "I could not find enough grounded OKF information to answer this safely. Please provide the missing facts or update the agent OKF knowledge so I can give a reliable answer.";
   }
-  return [
-    `Plan: ${state.plan || "Use the external LangGraph executor state to produce a grounded answer."}`,
-    [
-      "Dialogue:",
-      `- Context review: ${state.contextReview || "OKF and conversation context were checked."}`,
-      `- First action: ${state.action || "none"} returned: ${observation}`,
-      `- Reflection: ${state.reflection || "The agent checked whether additional evidence was needed."}`,
-      `- Follow-up: ${state.followupQuestion || "The agent checked policy and calendar constraints."}`
-    ].join("\n"),
-    [
-      "Evidence:",
-      `- ${observation}`,
-      `- ${state.policyObservation || "No separate policy observation was available."}`,
-      `- ${state.calendarObservation || "No separate calendar observation was available."}`
-    ].join("\n"),
-    `Final: ${final}`
-  ].join("\n");
+  return `${snippets.join(" ")} Based on these OKF-grounded checks, proceed only if the operational approval record and any required coverage confirmation are complete.`;
 }
 
 async function callGemini(apiKey, prompt) {
