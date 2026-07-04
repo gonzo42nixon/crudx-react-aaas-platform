@@ -497,9 +497,15 @@ function selectGraphTool(input, agent) {
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   if (!tools.length) return null;
   const text = String(input || "").toLowerCase();
+  const dates = extractIsoDates(input);
   if (/vacation|urlaub|days|tage|remaining|balance|approve|approval|period|request/.test(text)) {
-    return tools.find((tool) => /calculate|days/i.test(tool.name))
-      || tools.find((tool) => /search|knowledge/i.test(tool.name))
+    if (dates.length >= 2 || /business-day|business day|from\s+20\d{2}-\d{2}-\d{2}/i.test(input)) {
+      return tools.find((tool) => /calculate|days/i.test(tool.name))
+        || tools.find((tool) => /search|knowledge/i.test(tool.name))
+        || tools[0];
+    }
+    return tools.find((tool) => /search|knowledge/i.test(tool.name))
+      || tools.find((tool) => /calculate|days/i.test(tool.name))
       || tools[0];
   }
   return tools[0];
@@ -636,7 +642,9 @@ function normalizeGraphFinalAnswer(text, state) {
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
   if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
   const looksIncomplete = !raw
-    || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(raw);
+    || withoutFences.length < 180
+    || !/[.!?)]$/.test(withoutFences)
+    || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(withoutFences);
   const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
     || /LangGraph Node|Graph state|tool_observation|agent_reflection/i.test(withoutFences);
   return looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
@@ -702,12 +710,33 @@ function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
   const policy = String(state.policyObservation || "");
   const calendar = String(state.calendarObservation || "");
-  const snippets = [observation, policy, calendar]
+  const snippets = uniqueSentences([observation, policy, calendar])
     .filter((part) => part && !/^No observation available/i.test(part) && !/^Policy check: no/i.test(part) && !/^Calendar check: no/i.test(part));
   if (!snippets.length) {
     return "I could not find enough grounded OKF information to answer this safely. Please provide the missing facts or update the agent OKF knowledge so I can give a reliable answer.";
   }
-  return `${snippets.join(" ")} Based on these OKF-grounded checks, proceed only if the operational approval record and any required coverage confirmation are complete.`;
+  const dates = extractIsoDates(state.input || "");
+  const dateCaveat = dates.length >= 2
+    ? ""
+    : " I cannot calculate an exact absence period without concrete start and end dates.";
+  return `${snippets.join(" ")}${dateCaveat} Based on these OKF-grounded checks, proceed only if the operational approval record and any required coverage confirmation are complete.`;
+}
+
+function uniqueSentences(parts) {
+  const seen = new Set();
+  const result = [];
+  for (const sentence of parts.flatMap((part) => String(part || "").split(/(?<=\.)\s+/))) {
+    const cleaned = sentence
+      .replace(/^OKF knowledge lookup:\s*/i, "")
+      .replace(/^Policy check from OKF:\s*/i, "")
+      .replace(/^Calendar check:\s*/i, "Calendar check: ")
+      .trim();
+    const key = cleaned.toLowerCase();
+    if (!cleaned || seen.has(key)) continue;
+    seen.add(key);
+    result.push(cleaned);
+  }
+  return result;
 }
 
 async function callGemini(apiKey, prompt) {
