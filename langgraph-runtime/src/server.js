@@ -244,7 +244,7 @@ function createExternalLangGraph() {
         { action: state.action, input: state.input },
         { graph_node: "tool_observation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
         async () => ({
-          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey)
+          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey, langsmith)
         }),
         (result) => result
       );
@@ -310,7 +310,8 @@ function createExternalLangGraph() {
             state.agent,
             "search_knowledge_base",
             state.okfKey,
-            () => buildPolicyObservation(state.input, state.agent)
+            () => buildPolicyObservation(state.input, state.agent),
+            langsmith
           )
         }),
         (result) => result
@@ -335,7 +336,8 @@ function createExternalLangGraph() {
             state.agent,
             "calculate_days",
             state.okfKey,
-            () => buildCalendarObservation(state.input)
+            () => buildCalendarObservation(state.input),
+            langsmith
           )
         }),
         (result) => result
@@ -545,7 +547,7 @@ function buildContextReview(input, messages, agent) {
   ].join(" ");
 }
 
-async function executeOkfTool(input, agent, action, okfKey) {
+async function executeOkfTool(input, agent, action, okfKey, langsmith) {
   if (action === "none") return buildGraphObservation(input, agent, action);
 
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
@@ -560,30 +562,73 @@ async function executeOkfTool(input, agent, action, okfKey) {
   const fallback = buildGraphObservation(input, agent, action);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
+  const payload = {
+    tool: tool.name || action,
+    query: input,
+    input,
+    agent_id: agent?.agent_id || null,
+    okf_key: okfKey || null,
+    parameters: inferToolParameters(input, tool, agent),
+    knowledge: agent?.knowledge || "",
+    okf: agent?.okf || null,
+    meta: agent?.meta || {}
+  };
 
-  try {
+  const callWebhook = async () => {
     const response = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify({
-        tool: tool.name || action,
-        query: input,
-        input,
-        agent_id: agent?.agent_id || null,
-        okf_key: okfKey || null,
-        parameters: inferToolParameters(input, tool, agent),
-        knowledge: agent?.knowledge || "",
-        okf: agent?.okf || null,
-        meta: agent?.meta || {}
-      })
+      body: JSON.stringify(payload)
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body.ok === false) {
       const reason = body.error || body.message || response.statusText;
-      return `${fallback} Tool webhook ${tool.name || action} returned ${response.status}: ${reason}.`;
+      return {
+        ok: false,
+        status: response.status,
+        observation: `${fallback} Tool webhook ${tool.name || action} returned ${response.status}: ${reason}.`,
+        body
+      };
     }
-    return normalizeToolObservation(body, fallback);
+    return {
+      ok: true,
+      status: response.status,
+      observation: normalizeToolObservation(body, fallback),
+      body
+    };
+  };
+
+  try {
+    const result = await withLangSmithChild(
+      langsmith,
+      `OKF Tool Webhook: ${tool.name || action}`,
+      "tool",
+      {
+        tool: tool.name || action,
+        webhook_url: webhookUrl,
+        okf_key: okfKey || null,
+        agent_id: agent?.agent_id || null,
+        parameters: payload.parameters,
+        query: input
+      },
+      {
+        graph_node: "okf_tool_webhook",
+        tool_name: tool.name || action,
+        okf_key: okfKey || null,
+        webhook_url: webhookUrl,
+        transport: "https"
+      },
+      callWebhook,
+      (result) => ({
+        ok: Boolean(result.ok),
+        status: result.status || null,
+        tool: tool.name || action,
+        webhook_url: webhookUrl,
+        observation: result.observation || ""
+      })
+    );
+    return result.observation;
   } catch (error) {
     return `${fallback} Tool webhook ${tool.name || action} could not be reached: ${error.message || String(error)}.`;
   } finally {
@@ -591,13 +636,13 @@ async function executeOkfTool(input, agent, action, okfKey) {
   }
 }
 
-async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory) {
+async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory, langsmith) {
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   const tool = tools.find((candidate) => candidate.name === preferredName)
     || tools.find((candidate) => new RegExp(escapeRegex(preferredName), "i").test(candidate.name || ""));
   if (!tool) return fallbackFactory();
 
-  const observation = await executeOkfTool(input, agent, tool.name, okfKey);
+  const observation = await executeOkfTool(input, agent, tool.name, okfKey, langsmith);
   if (observation && !/No configured tool was selected/i.test(observation)) return observation;
   return fallbackFactory();
 }
