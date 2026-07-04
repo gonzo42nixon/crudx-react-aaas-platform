@@ -198,7 +198,8 @@ function createExternalLangGraph() {
       );
       trace?.push(step("langgraph", "node_context_review", {
         history_messages: state.messages.length,
-        review_chars: result.contextReview.length
+        review_chars: result.contextReview.length,
+        review_preview: previewText(result.contextReview)
       }));
       return {
         contextReview: result.contextReview,
@@ -228,7 +229,10 @@ function createExternalLangGraph() {
         },
         (result) => result
       );
-      trace?.push(step("langgraph", "node_agent_plan", result));
+      trace?.push(step("langgraph", "node_agent_plan", {
+        ...result,
+        plan_preview: previewText(result.plan)
+      }));
       return {
         plan: result.plan,
         action: result.action,
@@ -250,7 +254,8 @@ function createExternalLangGraph() {
       );
       trace?.push(step("langgraph", "node_tool_observation", {
         action: state.action,
-        observation_chars: result.observation.length
+        observation_chars: result.observation.length,
+        observation_preview: previewText(result.observation)
       }));
       return {
         observation: result.observation,
@@ -273,7 +278,10 @@ function createExternalLangGraph() {
         async () => ({ reflection: buildAgentReflection(state) }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_agent_reflection", { reflection_chars: result.reflection.length }));
+      trace?.push(step("langgraph", "node_agent_reflection", {
+        reflection_chars: result.reflection.length,
+        reflection_preview: previewText(result.reflection)
+      }));
       return {
         reflection: result.reflection,
         graphEvents: [{ node: "agent_reflection", text_chars: result.reflection.length }]
@@ -290,7 +298,10 @@ function createExternalLangGraph() {
         async () => ({ followupQuestion: buildInternalFollowupQuestion(state) }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_agent_followup_question", { question_chars: result.followupQuestion.length }));
+      trace?.push(step("langgraph", "node_agent_followup_question", {
+        question_chars: result.followupQuestion.length,
+        question_preview: previewText(result.followupQuestion)
+      }));
       return {
         followupQuestion: result.followupQuestion,
         graphEvents: [{ node: "agent_followup_question", text_chars: result.followupQuestion.length }]
@@ -316,7 +327,11 @@ function createExternalLangGraph() {
         }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_tool_policy_check", { observation_chars: result.policyObservation.length }));
+      trace?.push(step("langgraph", "node_tool_policy_check", {
+        action: "search_knowledge_base",
+        observation_chars: result.policyObservation.length,
+        observation_preview: previewText(result.policyObservation)
+      }));
       return {
         policyObservation: result.policyObservation,
         graphEvents: [{ node: "tool_policy_check", action: "search_knowledge_base" }]
@@ -342,7 +357,11 @@ function createExternalLangGraph() {
         }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_tool_calendar_check", { observation_chars: result.calendarObservation.length }));
+      trace?.push(step("langgraph", "node_tool_calendar_check", {
+        action: "calculate_days",
+        observation_chars: result.calendarObservation.length,
+        observation_preview: previewText(result.calendarObservation)
+      }));
       return {
         calendarObservation: result.calendarObservation,
         graphEvents: [{ node: "tool_calendar_check", action: "calculate_days" }]
@@ -363,7 +382,10 @@ function createExternalLangGraph() {
         async () => ({ synthesis: buildAgentSynthesis(state) }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_agent_synthesis", { synthesis_chars: result.synthesis.length }));
+      trace?.push(step("langgraph", "node_agent_synthesis", {
+        synthesis_chars: result.synthesis.length,
+        synthesis_preview: previewText(result.synthesis)
+      }));
       return {
         synthesis: result.synthesis,
         graphEvents: [{ node: "agent_synthesis", text_chars: result.synthesis.length }]
@@ -410,7 +432,8 @@ function createExternalLangGraph() {
       const finalAnswer = normalizeGraphFinalAnswer(result.text, state);
       trace?.push(step("langgraph", "node_agent_final", {
         model: GEMINI_MODEL,
-        text_chars: finalAnswer.length
+        text_chars: finalAnswer.length,
+        answer_preview: previewText(finalAnswer)
       }));
       return {
         finalAnswer,
@@ -875,6 +898,12 @@ function isRelevantKnowledgeLine(input, line) {
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function previewText(value, maxLength = 520) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}...`;
 }
 
 function buildDeterministicGraphSections(state) {
