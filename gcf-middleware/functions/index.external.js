@@ -177,6 +177,120 @@ exports.reactAaasInvoke = onRequest(
   }
 );
 
+exports.searchKnowledgeBase = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const knowledge = await resolveToolKnowledge(body);
+      const snippets = selectKnowledgeSnippets(body.query, knowledge);
+      res.status(200).json({
+        ok: true,
+        tool: "search_knowledge_base",
+        okf_key: body.okf_key || null,
+        agent_id: body.agent_id || null,
+        snippets,
+        observation: snippets.length
+          ? `OKF knowledge lookup: ${snippets.join(" ")}`
+          : "OKF knowledge lookup: no directly matching knowledge snippet was found in the OKF document."
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
+exports.calculateDays = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const parameters = body.parameters || {};
+      const dates = [
+        parameters.start_date || parameters.startDate,
+        parameters.end_date || parameters.endDate
+      ].filter(Boolean);
+      const inferredDates = dates.length >= 2 ? dates : extractIsoDates(body.query);
+
+      if (inferredDates.length < 2) {
+        res.status(200).json({
+          ok: true,
+          tool: "calculate_days",
+          needs_input: true,
+          observation: "Date calculation requested, but no exact start and end dates were supplied in the current turn."
+        });
+        return;
+      }
+
+      const startDate = String(inferredDates[0]).slice(0, 10);
+      const endDate = String(inferredDates[1]).slice(0, 10);
+      const businessDays = countWeekdays(startDate, endDate);
+      res.status(200).json({
+        ok: true,
+        tool: "calculate_days",
+        start_date: startDate,
+        end_date: endDate,
+        business_days: businessDays,
+        assumptions: ["Monday through Friday are counted as business days.", "No holiday calendar override is applied."],
+        observation: `Calculated business-day impact for ${startDate} to ${endDate} is ${businessDays} business days, assuming Monday through Friday and no holiday calendar overrides.`
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
+exports.checkServerStatus = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const knowledge = await resolveToolKnowledge(body);
+      const target = String(body.parameters?.target || body.query || "").trim();
+      const snippets = selectOperationalStatusSnippets(target, knowledge);
+      const observation = snippets.length
+        ? `Server status check from OKF: ${snippets.join(" ")}`
+        : "Server status check: no matching operational status entry was found in the OKF knowledge.";
+
+      res.status(200).json({
+        ok: true,
+        tool: "check_server_status",
+        okf_key: body.okf_key || null,
+        agent_id: body.agent_id || null,
+        target,
+        snippets,
+        observation
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
 exports.crudxApp = onRequest(
   {
     region: REGION,
@@ -248,6 +362,42 @@ function setCors(res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+}
+
+function handlePreflightOrReject(req, res) {
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return true;
+  }
+  if (req.method !== "POST") {
+    res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+    return true;
+  }
+  return false;
+}
+
+function normalizeToolRequest(rawBody) {
+  const body = typeof rawBody === "object" && rawBody ? rawBody : {};
+  return {
+    tool: String(body.tool || "").trim(),
+    query: String(body.query || body.input || "").trim(),
+    input: String(body.input || body.query || "").trim(),
+    agent_id: String(body.agent_id || body.agentId || "").trim(),
+    okf_key: String(body.okf_key || body.okfKey || "").trim(),
+    parameters: typeof body.parameters === "object" && body.parameters ? body.parameters : {},
+    knowledge: String(body.knowledge || ""),
+    okf: typeof body.okf === "object" && body.okf ? body.okf : null,
+    meta: typeof body.meta === "object" && body.meta ? body.meta : {}
+  };
+}
+
+async function resolveToolKnowledge(body) {
+  if (body.knowledge.trim()) return body.knowledge;
+  if (body.okf && typeof body.okf.knowledge === "string") return body.okf.knowledge;
+  if (!body.okf_key || !CRUDX_ID_RE.test(body.okf_key)) return "";
+  const envelope = await readCrudxEnvelope(body.okf_key);
+  const data = envelope && envelope.data ? envelope.data : envelope;
+  return String(data?.knowledge || "");
 }
 
 async function invokeExternalLangGraphRuntime(runtimeUrl, payload) {
@@ -468,6 +618,76 @@ function normalizeMessages(rawMessages) {
     })
     .filter(Boolean)
     .slice(-10);
+}
+
+function extractIsoDates(input) {
+  return Array.from(String(input || "").matchAll(/\b(20\d{2}-\d{2}-\d{2})\b/g))
+    .map((match) => match[1])
+    .filter((value, index, all) => all.indexOf(value) === index);
+}
+
+function countWeekdays(startIso, endIso) {
+  const start = parseIsoDate(startIso);
+  const end = parseIsoDate(endIso);
+  if (!start || !end) return 0;
+  const direction = start <= end ? 1 : -1;
+  let cursor = new Date(start);
+  let count = 0;
+  while ((direction === 1 && cursor <= end) || (direction === -1 && cursor >= end)) {
+    const day = cursor.getUTCDay();
+    if (day !== 0 && day !== 6) count += 1;
+    cursor.setUTCDate(cursor.getUTCDate() + direction);
+  }
+  return count;
+}
+
+function parseIsoDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function selectKnowledgeSnippets(input, knowledge, extraPatterns = []) {
+  const text = String(input || "").toLowerCase();
+  const terms = Array.from(new Set(text.match(/[a-zäöüß0-9_]{4,}/gi) || []))
+    .map((term) => term.toLowerCase());
+  const patterns = extraPatterns.length ? extraPatterns : terms.map((term) => new RegExp(escapeRegex(term), "i"));
+  return String(knowledge || "")
+    .split(/\n+|(?<=\.)\s+/)
+    .map((line) => line.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean)
+    .filter((line) => isRelevantKnowledgeLine(input, line))
+    .filter((line) => !patterns.length || patterns.some((pattern) => pattern.test(line)))
+    .slice(0, 5);
+}
+
+function selectOperationalStatusSnippets(input, knowledge) {
+  const terms = Array.from(new Set(String(input || "").toLowerCase().match(/[a-z0-9._-]{4,}/g) || []));
+  const fallbackPattern = /server|node|service|host|status|latency|degraded|online|offline|incident|ops/i;
+  return String(knowledge || "")
+    .split(/\n+/)
+    .map((line) => line.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean)
+    .filter((line) => {
+      const value = line.toLowerCase();
+      return terms.some((term) => value.includes(term)) || fallbackPattern.test(line);
+    })
+    .slice(0, 5);
+}
+
+function isRelevantKnowledgeLine(input, line) {
+  const query = String(input || "").toLowerCase();
+  const value = String(line || "").toLowerCase();
+  const asksMax = /max|mustermann|max_01/.test(query);
+  if (asksMax && /sandra|schreiber|sandra_02/.test(value)) return false;
+  const asksSandra = /sandra|schreiber|sandra_02/.test(query);
+  if (asksSandra && /max|mustermann|max_01/.test(value)) return false;
+  return true;
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function step(source, event, detail = {}) {

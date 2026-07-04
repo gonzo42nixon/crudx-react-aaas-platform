@@ -243,7 +243,9 @@ function createExternalLangGraph() {
         "tool",
         { action: state.action, input: state.input },
         { graph_node: "tool_observation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ observation: buildGraphObservation(state.input, state.agent, state.action) }),
+        async () => ({
+          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey)
+        }),
         (result) => result
       );
       trace?.push(step("langgraph", "node_tool_observation", {
@@ -302,7 +304,15 @@ function createExternalLangGraph() {
         "tool",
         { question: state.followupQuestion, tool: "search_knowledge_base" },
         { graph_node: "tool_policy_check", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ policyObservation: buildPolicyObservation(state.input, state.agent) }),
+        async () => ({
+          policyObservation: await executeNamedOkfTool(
+            state.input,
+            state.agent,
+            "search_knowledge_base",
+            state.okfKey,
+            () => buildPolicyObservation(state.input, state.agent)
+          )
+        }),
         (result) => result
       );
       trace?.push(step("langgraph", "node_tool_policy_check", { observation_chars: result.policyObservation.length }));
@@ -319,7 +329,15 @@ function createExternalLangGraph() {
         "tool",
         { question: state.followupQuestion, tool: "calculate_days" },
         { graph_node: "tool_calendar_check", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ calendarObservation: buildCalendarObservation(state.input) }),
+        async () => ({
+          calendarObservation: await executeNamedOkfTool(
+            state.input,
+            state.agent,
+            "calculate_days",
+            state.okfKey,
+            () => buildCalendarObservation(state.input)
+          )
+        }),
         (result) => result
       );
       trace?.push(step("langgraph", "node_tool_calendar_check", { observation_chars: result.calendarObservation.length }));
@@ -525,6 +543,102 @@ function buildContextReview(input, messages, agent) {
     `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local knowledge.`,
     "The executor should avoid a premature final answer and first check balance, policy constraints, and date impact where applicable."
   ].join(" ");
+}
+
+async function executeOkfTool(input, agent, action, okfKey) {
+  if (action === "none") return buildGraphObservation(input, agent, action);
+
+  const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
+  const tool = tools.find((candidate) => candidate.name === action)
+    || tools.find((candidate) => new RegExp(escapeRegex(action), "i").test(candidate.name || ""));
+  const webhookUrl = String(tool?.webhook_url || tool?.url || tool?.endpoint || "").trim();
+
+  if (!isHttpUrl(webhookUrl)) {
+    return buildGraphObservation(input, agent, action);
+  }
+
+  const fallback = buildGraphObservation(input, agent, action);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        tool: tool.name || action,
+        query: input,
+        input,
+        agent_id: agent?.agent_id || null,
+        okf_key: okfKey || null,
+        parameters: inferToolParameters(input, tool, agent),
+        knowledge: agent?.knowledge || "",
+        okf: agent?.okf || null,
+        meta: agent?.meta || {}
+      })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.ok === false) {
+      const reason = body.error || body.message || response.statusText;
+      return `${fallback} Tool webhook ${tool.name || action} returned ${response.status}: ${reason}.`;
+    }
+    return normalizeToolObservation(body, fallback);
+  } catch (error) {
+    return `${fallback} Tool webhook ${tool.name || action} could not be reached: ${error.message || String(error)}.`;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory) {
+  const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
+  const tool = tools.find((candidate) => candidate.name === preferredName)
+    || tools.find((candidate) => new RegExp(escapeRegex(preferredName), "i").test(candidate.name || ""));
+  if (!tool) return fallbackFactory();
+
+  const observation = await executeOkfTool(input, agent, tool.name, okfKey);
+  if (observation && !/No configured tool was selected/i.test(observation)) return observation;
+  return fallbackFactory();
+}
+
+function inferToolParameters(input, tool, agent) {
+  const name = String(tool?.name || "").toLowerCase();
+  const dates = extractIsoDates(input);
+  const params = { query: String(input || "") };
+  if (/calculate|days/.test(name) && dates.length >= 2) {
+    params.start_date = dates[0];
+    params.end_date = dates[1];
+  }
+  if (/server|status|node|health/.test(name)) {
+    params.target = inferServerTarget(input, agent);
+  }
+  return params;
+}
+
+function inferServerTarget(input, agent) {
+  const text = String(input || "");
+  const explicit = /(?:server|node|service|host)\s+([a-z0-9._-]+)/i.exec(text);
+  if (explicit) return explicit[1];
+  const knowledge = String(agent?.knowledge || "");
+  const known = /\b(?:server|node|service|host)[:\s]+([a-z0-9._-]+)/i.exec(knowledge);
+  return known ? known[1] : "";
+}
+
+function normalizeToolObservation(body, fallback) {
+  const value = body.observation || body.answer || body.result || body.message || body.summary;
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(body.snippets) && body.snippets.length) {
+    return `Tool observation: ${body.snippets.map((item) => String(item).trim()).filter(Boolean).join(" ")}`;
+  }
+  if (body.business_days !== undefined && body.start_date && body.end_date) {
+    return `Calculated business-day impact for ${body.start_date} to ${body.end_date} is ${body.business_days} business days.`;
+  }
+  return fallback;
+}
+
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
 }
 
 function buildGraphObservation(input, agent, action) {
