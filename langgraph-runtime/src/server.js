@@ -632,6 +632,7 @@ function buildGraphFinalPrompt(state) {
     "- Use prior conversation when relevant.",
     "- Separate known facts from missing information.",
     "- If facts come from OKF, simply say they are in the OKF context when useful.",
+    "- LangSmith tracing is handled automatically by the platform. If the user asks for a trace, acknowledge that trace metadata is attached by the platform; do not claim you cannot create traces.",
     "- Keep the final answer concise, practical, and readable.",
     "- Do not reveal internal node names unless the user explicitly asks for debugging."
   ].join("\n");
