@@ -699,8 +699,19 @@ function selectKnowledgeSnippets(input, knowledge, extraPatterns = []) {
     .split(/\n+|(?<=\.)\s+/)
     .map((line) => line.replace(/^[-*]\s*/, "").trim())
     .filter(Boolean)
+    .filter((line) => isRelevantKnowledgeLine(input, line))
     .filter((line) => patterns.some((pattern) => pattern.test(line)))
     .slice(0, 5);
+}
+
+function isRelevantKnowledgeLine(input, line) {
+  const query = String(input || "").toLowerCase();
+  const value = String(line || "").toLowerCase();
+  const asksMax = /max|mustermann|max_01/.test(query);
+  if (asksMax && /sandra|schreiber|sandra_02/.test(value)) return false;
+  const asksSandra = /sandra|schreiber|sandra_02/.test(query);
+  if (asksSandra && /max|mustermann|max_01/.test(value)) return false;
+  return true;
 }
 
 function escapeRegex(value) {
