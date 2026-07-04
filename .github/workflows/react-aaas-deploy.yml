@@ -76,6 +76,20 @@ jobs:
         working-directory: gcf-middleware/functions
         run: npm run lint
 
+      - name: Write Firebase runtime parameters
+        working-directory: gcf-middleware/functions
+        run: |
+          {
+            echo "CRUDX_DOCS_API=https://europe-west3-crudx-e0599.cloudfunctions.net/calendarApi/v1"
+            echo "GEMINI_MODEL=gemini-3.5-flash"
+            echo "LANGGRAPH_RUNTIME_URL=$CLOUD_RUN_URL"
+            echo "LANGGRAPH_RUNTIME_MODE=standalone"
+            echo "LANGGRAPH_ASSISTANT_ID=agent"
+            echo "LANGSMITH_ENDPOINT=$LANGSMITH_ENDPOINT"
+            echo "LANGSMITH_PROJECT=$LANGSMITH_PROJECT"
+            echo "LANGSMITH_WORKSPACE_ID=$LANGSMITH_WORKSPACE_ID"
+          } > .env.crudx-e0599
+
       - name: Deploy GCF middleware
         working-directory: gcf-middleware
         run: npx firebase-tools deploy --only functions:react-aaas:reactAaasInvoke --project "$GCP_PROJECT_ID" --non-interactive
