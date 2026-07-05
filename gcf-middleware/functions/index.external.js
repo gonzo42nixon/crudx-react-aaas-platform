@@ -16,6 +16,22 @@ const GOOGLE_MAPS_API_KEY = defineSecret("GOOGLE_MAPS_API_KEY");
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
 const CRUDX_OWNER = "drueffler@gmail.com";
+const LOCATION_ROUTE_TARGETS = {
+  gcp: {
+    id: "gcp_europe_west3_frankfurt",
+    label: "GCP europe-west3 reference point, Frankfurt, Germany",
+    latitude: 50.110924,
+    longitude: 8.682127,
+    note: "GCP europe-west3 is the configured platform region; Frankfurt city center is used as a routing reference point, not a public data-center entrance."
+  },
+  langsmith: {
+    id: "langsmith_reference_point",
+    label: "LangSmith cloud reference point, New York, NY, USA",
+    latitude: 40.712776,
+    longitude: -74.005974,
+    note: "LangSmith does not expose a per-request physical processing address in this app; this OKF uses a configured reference point for routing demonstrations."
+  }
+};
 
 exports.reactAaasInvoke = onRequest(
   {
@@ -381,6 +397,7 @@ exports.requestorLocation = onRequest(
         ? await reverseGeocodeWithGoogleMaps(consentedCoordinates, GOOGLE_MAPS_API_KEY.value())
         : null;
       const location = explicitLocation || reverseGeocoded || inferLocationFromContext(context);
+      const routeRequest = classifyRouteRequest(body.query || body.input || body.parameters?.query);
       const confidence = explicitLocation ? "high" : location ? location.confidence : "none";
       const evidence = [
         explicitLocation ? "explicit user-supplied location" : null,
@@ -396,7 +413,10 @@ exports.requestorLocation = onRequest(
         context.ip ? "forwarded request IP present" : null
       ].filter(Boolean);
 
-      const answer = location
+      const route = routeRequest ? buildRouteResponse(routeRequest, location, evidence) : null;
+      const answer = route
+        ? route.observation
+        : location
         ? `Requestor location estimate: ${location.label}. Confidence: ${confidence}. Evidence: ${evidence.join("; ")}.`
         : `Requestor location could not be determined reliably. Evidence available: ${evidence.join("; ") || "none"}. Ask the requestor to share location explicitly or pass browser geolocation with consent.`;
 
@@ -404,6 +424,7 @@ exports.requestorLocation = onRequest(
         ok: true,
         tool: "requestor_location",
         location: location || null,
+        route: route || null,
         confidence,
         evidence,
         request_context: redactRequestContext(context),
@@ -817,6 +838,102 @@ function inferExplicitLocation(body) {
     source: "explicit_text",
     confidence: "high"
   };
+}
+
+function classifyRouteRequest(query) {
+  const text = String(query || "").toLowerCase();
+  if (!/\b(route|directions|drive|travel|roundtrip|round trip|maps?)\b/i.test(text)) return null;
+  const wantsGcp = /\bgcp\b|google cloud|cloud run|europe-west3|frankfurt/i.test(text);
+  const wantsLangSmith = /langsmith|lang chain|langchain|slangsmith/i.test(text);
+  const roundtrip = /roundtrip|round trip|there and back|back to (?:me|requestor|origin)|zurück/i.test(text);
+  if (roundtrip) {
+    return { kind: "roundtrip", targets: ["gcp", "langsmith"] };
+  }
+  if (wantsGcp && wantsLangSmith) {
+    return { kind: "multi_stop", targets: ["gcp", "langsmith"] };
+  }
+  if (wantsLangSmith) return { kind: "single", targets: ["langsmith"] };
+  if (wantsGcp) return { kind: "single", targets: ["gcp"] };
+  return null;
+}
+
+function buildRouteResponse(routeRequest, location, evidence) {
+  const origin = extractLocationCoordinates(location);
+  if (!origin) {
+    return {
+      kind: routeRequest.kind,
+      needs_location: true,
+      observation: [
+        "A route requires an exact requestor origin.",
+        "Click the browser location button and allow geolocation, or provide explicit coordinates.",
+        `Evidence available: ${evidence.join("; ") || "none"}.`
+      ].join(" ")
+    };
+  }
+
+  const targets = routeRequest.targets.map((key) => LOCATION_ROUTE_TARGETS[key]).filter(Boolean);
+  if (!targets.length) return null;
+
+  const originLabel = `${origin.latitude},${origin.longitude}`;
+  const finalDestination = routeRequest.kind === "roundtrip"
+    ? origin
+    : targets[targets.length - 1];
+  const waypoints = routeRequest.kind === "roundtrip"
+    ? targets
+    : targets.slice(0, -1);
+  const url = googleMapsDirectionsUrl({
+    origin,
+    destination: finalDestination,
+    waypoints
+  });
+  const targetLabels = targets.map((target) => target.label).join(" -> ");
+  const notes = Array.from(new Set(targets.map((target) => target.note).filter(Boolean)));
+
+  return {
+    kind: routeRequest.kind,
+    origin: {
+      label: location.label || originLabel,
+      latitude: origin.latitude,
+      longitude: origin.longitude,
+      accuracy_m: location.accuracy_m || null
+    },
+    targets: targets.map((target) => ({
+      id: target.id,
+      label: target.label,
+      latitude: target.latitude,
+      longitude: target.longitude,
+      note: target.note
+    })),
+    google_maps_url: url,
+    observation: [
+      routeRequest.kind === "roundtrip"
+        ? `Roundtrip route: requestor -> ${targetLabels} -> requestor.`
+        : `Route: requestor -> ${targetLabels}.`,
+      `Requestor origin: ${location.label || originLabel}.`,
+      `Google Maps route: ${url}`,
+      notes.length ? `Notes: ${notes.join(" ")}` : ""
+    ].filter(Boolean).join(" ")
+  };
+}
+
+function extractLocationCoordinates(location) {
+  if (!location) return null;
+  const latitude = Number(location.latitude);
+  const longitude = Number(location.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return { latitude, longitude };
+}
+
+function googleMapsDirectionsUrl({ origin, destination, waypoints = [] }) {
+  const url = new URL("https://www.google.com/maps/dir/");
+  url.searchParams.set("api", "1");
+  url.searchParams.set("origin", `${origin.latitude},${origin.longitude}`);
+  url.searchParams.set("destination", `${destination.latitude},${destination.longitude}`);
+  if (waypoints.length) {
+    url.searchParams.set("waypoints", waypoints.map((point) => `${point.latitude},${point.longitude}`).join("|"));
+  }
+  url.searchParams.set("travelmode", "driving");
+  return url.toString();
 }
 
 function inferCoordinates(parameters) {

@@ -1073,7 +1073,8 @@ function buildGraphFinalPrompt(state) {
         "- Treat consented browser geolocation or explicit coordinates as high-confidence evidence.",
         "- If Google Maps reverse geocoding returned an address, use it as the location label and mention that it came from consented browser geolocation.",
         "- If only time zone, locale, or headers are available, explicitly label the result as low or medium confidence.",
-        "- Do not ask the user to paste coordinates when the graph state already contains consented browser geolocation evidence."
+        "- Do not ask the user to paste coordinates when the graph state already contains consented browser geolocation evidence.",
+        "- If the tool observation contains a Google Maps route URL, preserve that exact URL in the final answer."
       ].join("\n")
     : "";
   return [
@@ -1138,6 +1139,9 @@ function normalizeGraphFinalAnswer(text, state) {
     || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(withoutFences);
   const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
     || /LangGraph Node|Graph state|tool_observation|agent_reflection/i.test(withoutFences);
+  if (isLocationAgent(state.agent) && /https:\/\/www\.google\.com\/maps\/dir\//i.test([state.observation, state.synthesis].join("\n")) && !/https:\/\/www\.google\.com\/maps\/dir\//i.test(withoutFences)) {
+    return buildDeterministicGraphSections(state);
+  }
   return looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
 }
 
@@ -1366,7 +1370,7 @@ function buildDeterministicGraphSections(state) {
     if (!snippets.length) {
       return "I could not determine the requestor location reliably from the available context. Please provide an explicit place or consented browser geolocation if a more precise estimate is required.";
     }
-    if (/consented browser geolocation|reverse geocoding|Google Maps|Confidence:\s*high/i.test(snippets.join(" "))) {
+    if (/consented browser geolocation|reverse geocoding|Google Maps|https:\/\/www\.google\.com\/maps\/dir\/|Confidence:\s*high/i.test(snippets.join(" "))) {
       return snippets.join(" ");
     }
     return `${snippets.join(" ")} For greater precision, pass explicit coordinates or ask the requestor to share browser geolocation with consent.`;
