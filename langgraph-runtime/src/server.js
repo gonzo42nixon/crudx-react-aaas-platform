@@ -1244,7 +1244,9 @@ function buildGraphRevisionPrompt(state) {
     "",
     "You are the final revision node in a LangGraph ReAct executor.",
     "You have a draft answer and independent AI critic feedback.",
-    "Revise the draft only where the feedback improves correctness, completeness, clarity, or safety.",
+    "Your default behavior is to revise the draft. Treat supported critic feedback as an action list, not as optional commentary.",
+    "Apply every concrete improvement that is supported by the tool observations, graph synthesis, or prior conversation.",
+    "If a critic supplies a better_answer and it is supported by the evidence, use it as the baseline for the final answer.",
     "Preserve grounded facts, exact CRUDX IDs, and exact URLs from the draft or tool observations.",
     requiresJson
       ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence."
@@ -1276,7 +1278,8 @@ function buildGraphRevisionPrompt(state) {
     "- Use conversation history only when relevant.",
     "- Separate known facts, missing evidence, and recommendations where the question asks for it.",
     "- If a critic suggested unsupported facts, ignore them.",
-    "- If no critic suggestion is useful, keep the draft essentially unchanged."
+    "- If critics ask for structure, missing-evidence separation, less verbosity, or clearer caveats, implement those changes.",
+    "- Do not keep the draft unchanged unless every critic suggestion is unsupported or harmful."
   ].join("\n");
 }
 
@@ -1524,7 +1527,7 @@ function normalizeGraphFinalAnswer(text, state) {
   }
   if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
   const looksIncomplete = !raw
-    || withoutFences.length < 180
+    || withoutFences.length < 40
     || !/[.!?)]$/.test(withoutFences)
     || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(withoutFences);
   const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
