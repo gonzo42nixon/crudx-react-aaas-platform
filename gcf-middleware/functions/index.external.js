@@ -257,6 +257,48 @@ exports.calculateDays = onRequest(
   }
 );
 
+exports.peanoAddition = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const operands = inferPeanoOperands(body);
+      if (!operands) {
+        res.status(200).json({
+          ok: true,
+          tool: "peano_addition",
+          needs_input: true,
+          observation: JSON.stringify({
+            error: "Two non-negative integer operands are required."
+          })
+        });
+        return;
+      }
+
+      const result = executePeanoAddition(operands.left, operands.right);
+      res.status(200).json({
+        ok: true,
+        tool: "peano_addition",
+        ...result,
+        observation: JSON.stringify({
+          peano_result: result.peano_result,
+          integer_value: result.integer_value
+        })
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
 exports.checkServerStatus = onRequest(
   {
     region: REGION,
@@ -703,6 +745,74 @@ function selectOperationalStatusSnippets(input, knowledge) {
       return terms.some((term) => value.includes(term)) || fallbackPattern.test(line);
     })
     .slice(0, 5);
+}
+
+function inferPeanoOperands(body) {
+  const parameters = body.parameters || {};
+  const explicitLeft = parameters.left ?? parameters.x ?? parameters.a;
+  const explicitRight = parameters.right ?? parameters.y ?? parameters.b;
+  if (isNonNegativeIntegerLike(explicitLeft) && isNonNegativeIntegerLike(explicitRight)) {
+    return { left: Number(explicitLeft), right: Number(explicitRight) };
+  }
+
+  const query = String(body.query || body.input || "");
+  const addMatch = /\badd\s+(\d+)\s+(?:and|to)\s+(\d+)\b/i.exec(query)
+    || /\b(\d+)\s*(?:\+|plus)\s*(\d+)\b/i.exec(query)
+    || /\bA\(\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(query);
+  if (addMatch) return { left: Number(addMatch[1]), right: Number(addMatch[2]) };
+
+  const peanoTerms = Array.from(query.matchAll(/\bS\([^,\n]+?0\)+/g)).map((match) => match[0]);
+  if (peanoTerms.length >= 2) {
+    const left = peanoToInteger(peanoTerms[0]);
+    const right = peanoToInteger(peanoTerms[1]);
+    if (Number.isInteger(left) && Number.isInteger(right)) return { left, right };
+  }
+  return null;
+}
+
+function isNonNegativeIntegerLike(value) {
+  return /^\d+$/.test(String(value ?? ""));
+}
+
+function executePeanoAddition(left, right) {
+  if (!Number.isSafeInteger(left) || !Number.isSafeInteger(right) || left < 0 || right < 0) {
+    throw new Error("Peano addition only supports non-negative safe integers.");
+  }
+  if (left > 30 || right > 30) {
+    throw new Error("Peano addition test endpoint is capped at operands <= 30.");
+  }
+  const trace = [];
+  for (let remaining = right; remaining > 0; remaining -= 1) {
+    trace.push(`A(${integerToPeano(left)}, ${integerToPeano(remaining)}) -> S(A(${integerToPeano(left)}, ${integerToPeano(remaining - 1)}))`);
+  }
+  trace.push(`A(${integerToPeano(left)}, 0) = ${integerToPeano(left)}`);
+  return {
+    input: {
+      left,
+      right,
+      left_peano: integerToPeano(left),
+      right_peano: integerToPeano(right)
+    },
+    peano_result: integerToPeano(left + right),
+    integer_value: left + right,
+    recursion_trace: trace
+  };
+}
+
+function integerToPeano(value) {
+  let result = "0";
+  for (let index = 0; index < value; index += 1) result = `S(${result})`;
+  return result;
+}
+
+function peanoToInteger(value) {
+  let text = String(value || "").replace(/\s+/g, "");
+  let count = 0;
+  while (text.startsWith("S(") && text.endsWith(")")) {
+    count += 1;
+    text = text.slice(2, -1);
+  }
+  return text === "0" ? count : NaN;
 }
 
 function isRelevantKnowledgeLine(input, line) {

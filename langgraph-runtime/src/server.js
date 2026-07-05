@@ -222,7 +222,9 @@ function createExternalLangGraph() {
           const selectedTool = selectGraphTool(state.input, state.agent);
           return {
             plan: selectedTool
-              ? `Start with ${selectedTool.name}, then run follow-up checks before producing the final HR recommendation.`
+              ? isPeanoAgent(state.agent)
+                ? `Start with ${selectedTool.name}, verify the Peano recursion result, then return the required JSON object.`
+                : `Start with ${selectedTool.name}, then run follow-up checks before producing the final agent response.`
               : "Answer from the OKF context without invoking a configured tool.",
             action: selectedTool?.name || "none"
           };
@@ -541,6 +543,10 @@ function selectGraphTool(input, agent) {
   if (!tools.length) return null;
   const text = String(input || "").toLowerCase();
   const dates = extractIsoDates(input);
+  if (/peano|successor|add|addition|\bplus\b|\+|A\(/i.test(input)) {
+    return tools.find((tool) => /peano|add/i.test(tool.name))
+      || tools[0];
+  }
   if (/vacation|urlaub|days|tage|remaining|balance|approve|approval|period|request/.test(text)) {
     if (dates.length >= 2 || /business-day|business day|from\s+20\d{2}-\d{2}-\d{2}/i.test(input)) {
       return tools.find((tool) => /calculate|days/i.test(tool.name))
@@ -555,6 +561,14 @@ function selectGraphTool(input, agent) {
 }
 
 function buildContextReview(input, messages, agent) {
+  if (isPeanoAgent(agent)) {
+    return [
+      "The current turn concerns Peano arithmetic.",
+      `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local Peano knowledge.`,
+      "The executor should invoke the Peano addition tool for addition requests and preserve the OKF JSON output contract."
+    ].join(" ");
+  }
   const text = String(input || "").toLowerCase();
   const history = Array.isArray(messages) ? messages : [];
   const topics = [];
@@ -674,6 +688,13 @@ function inferToolParameters(input, tool, agent) {
   const name = String(tool?.name || "").toLowerCase();
   const dates = extractIsoDates(input);
   const params = { query: String(input || "") };
+  if (/peano|add/.test(name)) {
+    const operands = inferNaturalOperands(input);
+    if (operands) {
+      params.left = operands.left;
+      params.right = operands.right;
+    }
+  }
   if (/calculate|days/.test(name) && dates.length >= 2) {
     params.start_date = dates[0];
     params.end_date = dates[1];
@@ -682,6 +703,14 @@ function inferToolParameters(input, tool, agent) {
     params.target = inferServerTarget(input, agent);
   }
   return params;
+}
+
+function inferNaturalOperands(input) {
+  const text = String(input || "");
+  const match = /\badd\s+(\d+)\s+(?:and|to)\s+(\d+)\b/i.exec(text)
+    || /\b(\d+)\s*(?:\+|plus)\s*(\d+)\b/i.exec(text)
+    || /\bA\(\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(text);
+  return match ? { left: Number(match[1]), right: Number(match[2]) } : null;
 }
 
 function inferServerTarget(input, agent) {
@@ -731,6 +760,13 @@ function buildGraphObservation(input, agent, action) {
 }
 
 function buildAgentReflection(state) {
+  if (isPeanoAgent(state.agent)) {
+    return [
+      "The tool observation should already contain the deterministic Peano result.",
+      "The final response must preserve the OKF JSON object shape.",
+      `Current action was ${state.action || "none"}.`
+    ].join(" ");
+  }
   const hasDates = extractIsoDates(state.input || "").length >= 2;
   const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
   return [
@@ -742,6 +778,9 @@ function buildAgentReflection(state) {
 }
 
 function buildInternalFollowupQuestion(state) {
+  if (isPeanoAgent(state.agent)) {
+    return "Which Peano recursion rule and base case validate the structural result?";
+  }
   if (/2026-\d{2}-\d{2}/.test(String(state.input || ""))) {
     return "Which HR rules and date-calculation facts must be checked before this vacation request can be recommended for approval?";
   }
@@ -749,6 +788,9 @@ function buildInternalFollowupQuestion(state) {
 }
 
 function buildPolicyObservation(input, agent) {
+  if (isPeanoAgent(agent)) {
+    return "Peano rule check: addition is defined by A(x, 0) = x and A(x, S(y)) = S(A(x, y)).";
+  }
   const knowledge = String(agent?.knowledge || "");
   const snippets = selectKnowledgeSnippets(input, knowledge, [/policy|rule|request|approval|approve|vacation|urlaub|entitled|advance|weeks|days/i]);
   if (snippets.length) {
@@ -758,6 +800,9 @@ function buildPolicyObservation(input, agent) {
 }
 
 function buildCalendarObservation(input) {
+  if (/peano|successor|A\(|S\(/i.test(String(input || ""))) {
+    return "Non-temporal check: no calendar calculation is required for Peano arithmetic.";
+  }
   const dates = extractIsoDates(input);
   if (dates.length >= 2) {
     const days = countWeekdays(dates[0], dates[1]);
@@ -770,6 +815,14 @@ function buildCalendarObservation(input) {
 }
 
 function buildAgentSynthesis(state) {
+  if (isPeanoAgent(state.agent)) {
+    return [
+      "Synthesis:",
+      `1. Peano tool observation: ${state.observation || "none"}`,
+      `2. Rule observation: ${state.policyObservation || "none"}`,
+      "Recommendation logic: preserve the deterministic Peano result and return only the required JSON object."
+    ].join("\n");
+  }
   return [
     "Synthesis:",
     `1. Initial observation: ${state.observation || "none"}`,
@@ -780,13 +833,16 @@ function buildAgentSynthesis(state) {
 }
 
 function buildGraphFinalPrompt(state) {
+  const requiresJson = agentRequiresJsonOutput(state.agent);
   return [
     state.agent.okf.system_prompt,
     "",
     "You are the final response node in a multi-step LangGraph ReAct executor.",
     "Use the supplied graph state, OKF knowledge, and prior conversation.",
     "Return only the final user-facing answer.",
-    "Do not output JSON, Markdown code fences, raw graph state, trace data, or hidden chain-of-thought.",
+    requiresJson
+      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence."
+      : "Do not output JSON, Markdown code fences, raw graph state, trace data, or hidden chain-of-thought.",
     "Do not use headings named Plan, Dialogue, Evidence, or Final.",
     "Write like a helpful professional assistant speaking to the user.",
     "Mention missing information only when it materially affects the answer.",
@@ -815,7 +871,7 @@ function buildGraphFinalPrompt(state) {
     "- Separate known facts from missing information.",
     "- If facts come from OKF, simply say they are in the OKF context when useful.",
     "- LangSmith tracing is handled automatically by the platform. If the user asks for a trace, acknowledge that trace metadata is attached by the platform; do not claim you cannot create traces.",
-    "- Keep the final answer concise, practical, and readable.",
+    requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer concise, practical, and readable.",
     "- Do not reveal internal node names unless the user explicitly asks for debugging."
   ].join("\n");
 }
@@ -823,6 +879,11 @@ function buildGraphFinalPrompt(state) {
 function normalizeGraphFinalAnswer(text, state) {
   const raw = String(text || "").trim();
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  if (agentRequiresJsonOutput(state.agent)) {
+    if (looksLikeJson(withoutFences)) return withoutFences;
+    const fromState = extractJsonObjectFromText([state.observation, state.policyObservation, state.calendarObservation, state.synthesis].join("\n"));
+    if (fromState) return fromState;
+  }
   if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
   const looksIncomplete = !raw
     || withoutFences.length < 180
@@ -831,6 +892,37 @@ function normalizeGraphFinalAnswer(text, state) {
   const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
     || /LangGraph Node|Graph state|tool_observation|agent_reflection/i.test(withoutFences);
   return looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
+}
+
+function agentRequiresJsonOutput(agent) {
+  const prompt = String(agent?.okf?.system_prompt || "");
+  const knowledge = String(agent?.knowledge || "");
+  return /valid JSON object|strictly with a valid JSON|JSON Response|peano_result|integer_value/i.test(`${prompt}\n${knowledge}`);
+}
+
+function isPeanoAgent(agent) {
+  const haystack = [
+    agent?.agent_id,
+    agent?.meta?.id,
+    agent?.meta?.name,
+    agent?.okf?.system_prompt,
+    (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
+  ].join("\n");
+  return /peano|math-peano-core|peano_addition/i.test(haystack);
+}
+
+function extractJsonObjectFromText(text) {
+  const value = String(text || "");
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  const candidate = value.slice(start, end + 1);
+  try {
+    JSON.parse(candidate);
+    return candidate;
+  } catch {
+    return null;
+  }
 }
 
 function looksLikeJson(text) {
