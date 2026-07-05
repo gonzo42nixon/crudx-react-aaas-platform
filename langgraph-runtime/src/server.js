@@ -1254,7 +1254,7 @@ function buildGraphRevisionPrompt(state) {
     "Default brevity rule: keep the final answer under 120 words and usually 2-4 sentences unless the user explicitly asked for a detailed/audit/handoff/comparison report.",
     "Prefer a shorter supported critic answer over a longer draft when both are correct.",
     requiresJson
-      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence."
+      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence, no prose, and no extra fields unless the existing OKF schema explicitly allows them."
       : "Return only the final user-facing answer. Do not output JSON, Markdown code fences, trace data, or hidden chain-of-thought.",
     "Do not mention that competing AIs reviewed the answer unless the user explicitly asks about the feedback loop.",
     "",
@@ -1283,10 +1283,11 @@ function buildGraphRevisionPrompt(state) {
     "- Use conversation history only when relevant.",
     "- Separate known facts, missing evidence, and recommendations where the question asks for it.",
     "- If a critic suggested unsupported facts, ignore them.",
+    requiresJson ? "- If a critic suggests prose, Markdown, or extra JSON fields that violate the required JSON schema, ignore that part of the critique." : "",
     "- If critics ask for structure, missing-evidence separation, less verbosity, or clearer caveats, implement those changes.",
     "- Do not keep the draft unchanged unless every critic suggestion is unsupported or harmful.",
     "- Remove redundant explanation and platform/process wording before returning the final answer."
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 async function collectAiCriticFeedback(state) {
@@ -1529,6 +1530,8 @@ function normalizeGraphFinalAnswer(text, state) {
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
   if (agentRequiresJsonOutput(state.agent)) {
     if (looksLikeJson(withoutFences)) return withoutFences;
+    const fromRaw = extractJsonObjectFromText(withoutFences);
+    if (fromRaw) return fromRaw;
     const fromState = extractJsonObjectFromText([state.observation, formatFollowupObservations(state.followupObservations), state.synthesis].join("\n"));
     if (fromState) return fromState;
   }
@@ -1789,6 +1792,10 @@ function previewText(value, maxLength = 520) {
 function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
   const followups = formatFollowupObservations(state.followupObservations);
+  if (isPeanoAgent(state.agent)) {
+    const json = extractJsonObjectFromText([observation, followups, state.synthesis || ""].join("\n"));
+    return json || "{\"error\":\"Peano addition result was not available\"}";
+  }
   if (isLocationAgent(state.agent)) {
     const snippets = uniqueSentences([observation, followups])
       .filter((part) => part && !/^No observation available/i.test(part));
