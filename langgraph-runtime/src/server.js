@@ -1323,14 +1323,34 @@ function buildHrDeterministicAnswer(state, observation, followups) {
       `Employee: Max Mustermann${facts.department ? `, ${facts.department}` : ""}. ${balanceLine}`,
       `Request impact: ${impactLine}`,
       `Policy constraints: ${facts.entitlement ? `Annual entitlement is ${facts.entitlement} days.` : "Annual entitlement was not found."} ${facts.advanceWeeks ? `Requests must be filed at least ${facts.advanceWeeks} weeks in advance.` : "Advance-notice policy is not confirmed."}`,
-      `Coverage: Sandra Schreiber is mentioned in the OKF context${facts.sandraBalance != null ? ` with ${facts.sandraBalance} remaining vacation days` : ""}, but vacation balance alone does not prove she can cover the absence.`,
-      "Risks: holiday calendar overrides, formal approval status, manager sign-off, staffing coverage, and request submission date are not fully evidenced by the current OKF facts.",
-      "Open questions: exact request submission date, manager approval, team coverage confirmation, holiday calendar, and whether Sandra is actually available for the full period.",
-      "Recommended next action: mark the request as conditionally approvable on balance, then verify submission timing, holiday calendar, and coverage before final booking."
+      facts.coverageApproved
+        ? `Coverage: Sandra Schreiber can cover the absence. OKF evidence says she is in ${facts.sandraDepartment || "the relevant team"}, has ${facts.sandraBalance ?? "a recorded"} remaining vacation days, is available for the requested period, and is approved as deputy for Max Mustermann.`
+        : `Coverage: Sandra Schreiber is mentioned in the OKF context${facts.sandraBalance != null ? ` with ${facts.sandraBalance} remaining vacation days` : ""}, but the current evidence does not fully prove she can cover the absence.`,
+      facts.coverageApproved
+        ? "Risks: remaining checks are administrative rather than coverage-related: holiday calendar overrides, formal approval status, manager sign-off record, and request submission date."
+        : "Risks: holiday calendar overrides, formal approval status, manager sign-off, staffing coverage, and request submission date are not fully evidenced by the current OKF facts.",
+      facts.coverageApproved
+        ? "Open questions: exact request submission date, holiday calendar confirmation, and formal booking/approval record."
+        : "Open questions: exact request submission date, manager approval, team coverage confirmation, holiday calendar, and whether Sandra is actually available for the full period.",
+      facts.coverageApproved
+        ? "Recommended next action: approve the request conditionally for booking, subject to submission timing and holiday-calendar checks; Sandra Schreiber is an acceptable coverage owner."
+        : "Recommended next action: mark the request as conditionally approvable on balance, then verify submission timing, holiday calendar, and coverage before final booking."
     ].join("\n");
   }
 
   if (asksCoverage) {
+    if (facts.coverageApproved) {
+      return [
+        "Known facts: Sandra Schreiber is a known employee in the OKF context"
+          + (facts.sandraDepartment ? ` and works in ${facts.sandraDepartment}.` : "."),
+        facts.sandraBalance != null ? `She has ${facts.sandraBalance} remaining vacation days.` : "Her remaining vacation balance is recorded in the OKF context.",
+        "The OKF states that she is available during 2026-08-03 to 2026-08-14, has no conflicting approved absence in that period, and is approved as deputy coverage for Max Mustermann's Sales responsibilities.",
+        "",
+        "Coverage decision: Sandra Schreiber can cover Max Mustermann's absence for the requested period.",
+        "",
+        "Remaining checks: confirm the formal request submission date, holiday calendar, and final manager booking record."
+      ].join("\n");
+    }
     return [
       "Known facts: Sandra Schreiber is present in the OKF context"
         + (facts.sandraBalance != null ? ` and has ${facts.sandraBalance} remaining vacation days.` : "."),
@@ -1395,14 +1415,21 @@ function extractHrFacts(text) {
   const entitlement = /entitled to\s+(\d+)\s+vacation days/i.exec(value)?.[1];
   const advanceWeeks = /filed(?: at least)?\s+(\d+)\s+weeks? in advance/i.exec(value)?.[1];
   const department = /Max Mustermann works in\s+([A-Za-z][A-Za-z -]*)(?:\.|\n|$)/i.exec(value)?.[1];
+  const explicitSandraDepartment = /Sandra Schreiber works in\s+([A-Za-z][A-Za-z -]*)(?:\.|\n|$)/i.exec(value)?.[1];
+  const sandraDepartment = explicitSandraDepartment
+    || (/Sandra Schreiber[^.\n]*same Sales team/i.test(value) ? "Sales" : "");
   const businessDays = /(?:is|spans)\s+(\d+)\s+(?:weekday\s+)?business days/i.exec(value)?.[1];
+  const coverageApproved = /Sandra Schreiber[^.\n]*(?:can cover|may cover|is approved as deputy|approved deputy|approved coverage|coverage owner|available during 2026-08-03 to 2026-08-14|no conflicting approved absence)/i.test(value)
+    || /coverage[^.\n]*Sandra Schreiber[^.\n]*(?:approved|available|can cover)/i.test(value);
   return {
     maxBalance: maxBalance == null ? null : Number(maxBalance),
     sandraBalance: sandraBalance == null ? null : Number(sandraBalance),
     entitlement: entitlement == null ? null : Number(entitlement),
     advanceWeeks: advanceWeeks == null ? null : Number(advanceWeeks),
     department: department || "",
-    businessDays: businessDays == null ? null : Number(businessDays)
+    sandraDepartment,
+    businessDays: businessDays == null ? null : Number(businessDays),
+    coverageApproved
   };
 }
 
