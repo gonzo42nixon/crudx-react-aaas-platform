@@ -153,6 +153,10 @@ function createExternalLangGraph() {
     contextReview: Annotation(),
     reflection: Annotation(),
     followupQuestion: Annotation(),
+    followupObservations: Annotation({
+      reducer: (_left, right) => right,
+      default: () => []
+    }),
     policyObservation: Annotation(),
     calendarObservation: Annotation(),
     synthesis: Annotation(),
@@ -232,7 +236,7 @@ function createExternalLangGraph() {
                 ? `Start with ${selectedTool.name}, verify the Peano recursion result, then return the required JSON object.`
                 : isLocationAgent(state.agent)
                   ? `Start with ${selectedTool.name}, classify the evidence level, then produce a privacy-aware location estimate.`
-                : `Start with ${selectedTool.name}, then run follow-up checks before producing the final agent response.`
+                : `Start with ${selectedTool.name}, then evaluate only relevant OKF follow-up tools before producing the final response.`
               : "Answer from the OKF context without invoking a configured tool.",
             action: selectedTool?.name || "none"
           };
@@ -317,66 +321,26 @@ function createExternalLangGraph() {
         graphEvents: [{ node: "agent_followup_question", text_chars: result.followupQuestion.length }]
       };
     })
-    .addNode("tool_policy_check", async (state, config) => {
+    .addNode("tool_followups", async (state, config) => {
       const { langsmith, trace } = config.configurable || {};
       const result = await withLangSmithChild(
         langsmith,
-        "LangGraph Node: tool_policy_check",
+        "LangGraph Node: tool_followups",
         "tool",
-        { question: state.followupQuestion, tool: "search_knowledge_base" },
-        { graph_node: "tool_policy_check", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({
-          policyObservation: await executeNamedOkfTool(
-            state.input,
-            state.agent,
-            "search_knowledge_base",
-            state.okfKey,
-            () => buildPolicyObservation(state.input, state.agent),
-            langsmith,
-            state.metadata
-          )
-        }),
+        { question: state.followupQuestion, primary_action: state.action },
+        { graph_node: "tool_followups", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => ({ followupObservations: await executeRelevantFollowupTools(state, langsmith) }),
         (result) => result
       );
-      trace?.push(step("langgraph", "node_tool_policy_check", {
-        action: "search_knowledge_base",
-        observation_chars: result.policyObservation.length,
-        observation_preview: previewText(result.policyObservation)
+      const observations = Array.isArray(result.followupObservations) ? result.followupObservations : [];
+      trace?.push(step("langgraph", "node_tool_followups", {
+        actions: observations.map((item) => item.tool),
+        observation_count: observations.length,
+        observation_preview: previewText(observations.map((item) => `${item.tool}: ${item.observation}`).join(" "))
       }));
       return {
-        policyObservation: result.policyObservation,
-        graphEvents: [{ node: "tool_policy_check", action: "search_knowledge_base" }]
-      };
-    })
-    .addNode("tool_calendar_check", async (state, config) => {
-      const { langsmith, trace } = config.configurable || {};
-      const result = await withLangSmithChild(
-        langsmith,
-        "LangGraph Node: tool_calendar_check",
-        "tool",
-        { question: state.followupQuestion, tool: "calculate_days" },
-        { graph_node: "tool_calendar_check", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({
-          calendarObservation: await executeNamedOkfTool(
-            state.input,
-            state.agent,
-            "calculate_days",
-            state.okfKey,
-            () => buildCalendarObservation(state.input),
-            langsmith,
-            state.metadata
-          )
-        }),
-        (result) => result
-      );
-      trace?.push(step("langgraph", "node_tool_calendar_check", {
-        action: "calculate_days",
-        observation_chars: result.calendarObservation.length,
-        observation_preview: previewText(result.calendarObservation)
-      }));
-      return {
-        calendarObservation: result.calendarObservation,
-        graphEvents: [{ node: "tool_calendar_check", action: "calculate_days" }]
+        followupObservations: observations,
+        graphEvents: [{ node: "tool_followups", actions: observations.map((item) => item.tool) }]
       };
     })
     .addNode("agent_synthesis", async (state, config) => {
@@ -387,8 +351,7 @@ function createExternalLangGraph() {
         "chain",
         {
           observation: state.observation,
-          policy_observation: state.policyObservation,
-          calendar_observation: state.calendarObservation
+          followup_observations: state.followupObservations
         },
         { graph_node: "agent_synthesis", agent_id: state.agent.agent_id, okf_key: state.okfKey },
         async () => ({ synthesis: buildAgentSynthesis(state) }),
@@ -459,9 +422,8 @@ function createExternalLangGraph() {
     .addEdge("agent_plan", "tool_observation")
     .addEdge("tool_observation", "agent_reflection")
     .addEdge("agent_reflection", "agent_followup_question")
-    .addEdge("agent_followup_question", "tool_policy_check")
-    .addEdge("tool_policy_check", "tool_calendar_check")
-    .addEdge("tool_calendar_check", "agent_synthesis")
+    .addEdge("agent_followup_question", "tool_followups")
+    .addEdge("tool_followups", "agent_synthesis")
     .addEdge("agent_synthesis", "agent_final")
     .addEdge("agent_final", END)
     .compile();
@@ -594,15 +556,15 @@ function buildContextReview(input, messages, agent) {
   const text = String(input || "").toLowerCase();
   const history = Array.isArray(messages) ? messages : [];
   const topics = [];
-  if (/max|mustermann/i.test(input)) topics.push("employee Max Mustermann");
-  if (/vacation|urlaub|days|tage|approval|approve|period|request/.test(text)) topics.push("vacation request");
-  if (/2026-\d{2}-\d{2}/.test(text)) topics.push("dated absence period");
+  if (/2026-\d{2}-\d{2}/.test(text)) topics.push("dated request");
+  if (/server|status|incident|latency|node|host/.test(text)) topics.push("operational status request");
+  if (/policy|rule|knowledge|lookup|search/.test(text)) topics.push("knowledge-grounded request");
   if (!topics.length) topics.push("general OKF-backed request");
   return [
     `The current turn concerns ${topics.join(", ")}.`,
     `Prior conversation turns available: ${history.length}.`,
     `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local knowledge.`,
-    "The executor should avoid a premature final answer and first check balance, policy constraints, and date impact where applicable."
+    "The executor should avoid a premature final answer and use only tools that are configured in the active OKF and relevant to the current request."
   ].join(" ");
 }
 
@@ -711,6 +673,53 @@ async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallback
   return fallbackFactory();
 }
 
+async function executeRelevantFollowupTools(state, langsmith) {
+  const tools = Array.isArray(state.agent?.okf?.allowed_tools) ? state.agent.okf.allowed_tools : [];
+  const followups = tools
+    .filter((tool) => tool?.name && tool.name !== state.action)
+    .filter((tool) => shouldRunToolForInput(tool, state.input, state.agent));
+  const observations = [];
+  for (const tool of followups.slice(0, 3)) {
+    const observation = await executeOkfTool(
+      state.input,
+      state.agent,
+      tool.name,
+      state.okfKey,
+      langsmith,
+      state.metadata
+    );
+    if (observation && !/No configured tool was selected/i.test(observation)) {
+      observations.push({
+        tool: tool.name,
+        observation
+      });
+    }
+  }
+  return observations;
+}
+
+function shouldRunToolForInput(tool, input, agent) {
+  const name = String(tool?.name || "").toLowerCase();
+  const description = String(tool?.description || "").toLowerCase();
+  const text = String(input || "").toLowerCase();
+  const haystack = `${name} ${description}`;
+  if (/calculate|calendar|date|days|business/.test(haystack)) {
+    return extractIsoDates(input).length >= 2
+      || /\b(from\s+20\d{2}-\d{2}-\d{2}|between\s+20\d{2}-\d{2}-\d{2}|business day|business days|calendar|date range|dated period|period from|start date|end date)\b/i.test(input);
+  }
+  if (/search|knowledge|policy|rule|lookup/.test(haystack)) {
+    if (isPeanoAgent(agent) || isLocationAgent(agent)) return false;
+    return /\b(policy|rule|knowledge|search|lookup|hr|vacation|urlaub|employee|server|status|incident|ops)\b/i.test(input);
+  }
+  if (/requestor|requester|location|geo|standort/.test(haystack)) {
+    return /requestor|requester|aufenthaltsort|standort|location|where am i|wo bin ich/i.test(input);
+  }
+  if (/peano|addition|successor/.test(haystack)) {
+    return /peano|successor|add|addition|\bplus\b|\+|A\(/i.test(input);
+  }
+  return false;
+}
+
 function inferToolParameters(input, tool, agent) {
   const name = String(tool?.name || "").toLowerCase();
   const dates = extractIsoDates(input);
@@ -812,10 +821,12 @@ function buildAgentReflection(state) {
   }
   const hasDates = extractIsoDates(state.input || "").length >= 2;
   const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
+  const hasFollowups = Array.isArray(state.followupObservations) && state.followupObservations.length > 0;
   return [
-    "The first observation should be combined with OKF policy knowledge before answering.",
-    hasDates ? "The request includes exact dates, so calendar impact can be checked." : "No complete date range was supplied, so date impact may need clarification.",
-    hasKnowledge ? "The OKF knowledge base is available for factual grounding." : "No OKF knowledge text is available, so the answer must state that limitation.",
+    "The primary observation should be combined with the OKF knowledge and any relevant follow-up tool observations before answering.",
+    hasFollowups ? "Additional OKF tool observations are available for grounding." : "No additional OKF follow-up tool was relevant for this turn.",
+    hasDates ? "The request includes exact dates; date-aware tools may be relevant only if configured in this agent OKF." : "No complete date range was supplied.",
+    hasKnowledge ? "The OKF knowledge base is available for factual grounding." : "No OKF knowledge text is available, so the answer must state that limitation when relevant.",
     `Current action was ${state.action || "none"}.`
   ].join(" ");
 }
@@ -828,9 +839,9 @@ function buildInternalFollowupQuestion(state) {
     return "Which evidence level supports this location estimate, and what consent or context is missing for higher precision?";
   }
   if (/2026-\d{2}-\d{2}/.test(String(state.input || ""))) {
-    return "Which HR rules and date-calculation facts must be checked before this vacation request can be recommended for approval?";
+    return "Which configured OKF tools or knowledge facts are still relevant before producing a grounded answer?";
   }
-  return "What missing employee, policy, or date information prevents a fully grounded approval recommendation?";
+  return "What missing context, tool evidence, or OKF knowledge prevents a fully grounded answer?";
 }
 
 function buildPolicyObservation(input, agent) {
@@ -867,11 +878,12 @@ function buildCalendarObservation(input) {
 }
 
 function buildAgentSynthesis(state) {
+  const followupText = formatFollowupObservations(state.followupObservations);
   if (isPeanoAgent(state.agent)) {
     return [
       "Synthesis:",
       `1. Peano tool observation: ${state.observation || "none"}`,
-      `2. Rule observation: ${state.policyObservation || "none"}`,
+      `2. Follow-up observations: ${followupText || "none"}`,
       "Recommendation logic: preserve the deterministic Peano result and return only the required JSON object."
     ].join("\n");
   }
@@ -879,17 +891,15 @@ function buildAgentSynthesis(state) {
     return [
       "Synthesis:",
       `1. Location observation: ${state.observation || "none"}`,
-      `2. Privacy observation: ${state.policyObservation || "none"}`,
-      `3. Temporal observation: ${state.calendarObservation || "none"}`,
+      `2. Follow-up observations: ${followupText || "none"}`,
       "Recommendation logic: answer transparently with confidence, evidence, and any missing consent/context needed for greater precision."
     ].join("\n");
   }
   return [
     "Synthesis:",
-    `1. Initial observation: ${state.observation || "none"}`,
-    `2. Policy observation: ${state.policyObservation || "none"}`,
-    `3. Calendar observation: ${state.calendarObservation || "none"}`,
-    "Recommendation logic: answer only after combining balance, policy timing, and date impact; identify any missing operational approval data separately."
+    `1. Primary observation: ${state.observation || "none"}`,
+    `2. Follow-up observations: ${followupText || "none"}`,
+    "Recommendation logic: answer from the active OKF, configured tools, prior conversation, and explicit uncertainty only."
   ].join("\n");
 }
 
@@ -915,8 +925,7 @@ function buildGraphFinalPrompt(state) {
     `Initial observation: ${state.observation || "none"}`,
     `Agent reflection: ${state.reflection || "none"}`,
     `Internal follow-up question: ${state.followupQuestion || "none"}`,
-    `Policy observation: ${state.policyObservation || "none"}`,
-    `Calendar observation: ${state.calendarObservation || "none"}`,
+    `Follow-up observations: ${formatFollowupObservations(state.followupObservations) || "none"}`,
     `Synthesis: ${state.synthesis || "none"}`,
     "",
     "Available OKF knowledge:",
@@ -942,7 +951,7 @@ function normalizeGraphFinalAnswer(text, state) {
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
   if (agentRequiresJsonOutput(state.agent)) {
     if (looksLikeJson(withoutFences)) return withoutFences;
-    const fromState = extractJsonObjectFromText([state.observation, state.policyObservation, state.calendarObservation, state.synthesis].join("\n"));
+    const fromState = extractJsonObjectFromText([state.observation, formatFollowupObservations(state.followupObservations), state.synthesis].join("\n"));
     if (fromState) return fromState;
   }
   if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
@@ -1072,26 +1081,29 @@ function previewText(value, maxLength = 520) {
 
 function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
-  const policy = String(state.policyObservation || "");
-  const calendar = String(state.calendarObservation || "");
+  const followups = formatFollowupObservations(state.followupObservations);
   if (isLocationAgent(state.agent)) {
-    const snippets = uniqueSentences([observation, policy, calendar])
+    const snippets = uniqueSentences([observation, followups])
       .filter((part) => part && !/^No observation available/i.test(part));
     if (!snippets.length) {
       return "I could not determine the requestor location reliably from the available context. Please provide an explicit place or consented browser geolocation if a more precise estimate is required.";
     }
     return `${snippets.join(" ")} For greater precision, pass explicit coordinates or ask the requestor to share browser geolocation with consent.`;
   }
-  const snippets = uniqueSentences([observation, policy, calendar])
-    .filter((part) => part && !/^No observation available/i.test(part) && !/^Policy check: no/i.test(part) && !/^Calendar check: no/i.test(part));
+  const snippets = uniqueSentences([observation, followups])
+    .filter((part) => part && !/^No observation available/i.test(part));
   if (!snippets.length) {
     return "I could not find enough grounded OKF information to answer this safely. Please provide the missing facts or update the agent OKF knowledge so I can give a reliable answer.";
   }
-  const dates = extractIsoDates(state.input || "");
-  const dateCaveat = dates.length >= 2
-    ? ""
-    : " I cannot calculate an exact absence period without concrete start and end dates.";
-  return `${snippets.join(" ")}${dateCaveat} Based on these OKF-grounded checks, proceed only if the operational approval record and any required coverage confirmation are complete.`;
+  return `${snippets.join(" ")} Answer is grounded in the active OKF document and configured tool observations.`;
+}
+
+function formatFollowupObservations(items) {
+  if (!Array.isArray(items) || !items.length) return "";
+  return items
+    .map((item) => `${item.tool || "tool"}: ${item.observation || ""}`.trim())
+    .filter(Boolean)
+    .join(" ");
 }
 
 function uniqueSentences(parts) {
