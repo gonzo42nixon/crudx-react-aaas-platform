@@ -12,6 +12,8 @@ const LANGGRAPH_RUNTIME_URL = defineString("LANGGRAPH_RUNTIME_URL", { default: "
 const LANGGRAPH_RUNTIME_TOKEN = defineSecret("LANGGRAPH_RUNTIME_TOKEN");
 const LANGGRAPH_RUNTIME_MODE = defineString("LANGGRAPH_RUNTIME_MODE", { default: "standalone" });
 const LANGGRAPH_ASSISTANT_ID = defineString("LANGGRAPH_ASSISTANT_ID", { default: "agent" });
+const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
+const GEMINI_TRANSLATION_MODEL = defineString("GEMINI_TRANSLATION_MODEL", { default: "gemini-3.5-flash" });
 const GOOGLE_MAPS_API_KEY = defineSecret("GOOGLE_MAPS_API_KEY");
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
@@ -193,6 +195,43 @@ exports.reactAaasInvoke = onRequest(
         trace,
         runtime: failedEnvelope.runtime
       });
+    }
+  }
+);
+
+exports.translateAnswer = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 45,
+    memory: "256MiB",
+    secrets: [GEMINI_API_KEY]
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = typeof req.body === "object" && req.body ? req.body : {};
+      const text = String(body.text || body.answer || "").trim();
+      const target = normalizeTranslationTarget(body.target || body.language || body.lang);
+      if (!text) {
+        res.status(400).json({ ok: false, error: "TEXT_REQUIRED" });
+        return;
+      }
+      if (!target) {
+        res.status(400).json({ ok: false, error: "SUPPORTED_TARGET_REQUIRED", supported: ["de", "fr"] });
+        return;
+      }
+      const translation = await translateWithGemini(text, target);
+      res.status(200).json({
+        ok: true,
+        target,
+        language: target === "de" ? "German" : "French",
+        translation
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
     }
   }
 );
@@ -554,6 +593,44 @@ function handlePreflightOrReject(req, res) {
     return true;
   }
   return false;
+}
+
+function normalizeTranslationTarget(value) {
+  const target = String(value || "").trim().toLowerCase();
+  if (target === "d" || target === "de" || target === "deutsch" || target === "german") return "de";
+  if (target === "f" || target === "fr" || target === "francais" || target === "français" || target === "french") return "fr";
+  return "";
+}
+
+async function translateWithGemini(text, target) {
+  const apiKey = GEMINI_API_KEY.value();
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured for translation");
+  const language = target === "de" ? "German" : "French";
+  const model = GEMINI_TRANSLATION_MODEL.value() || "gemini-3.5-flash";
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const prompt = [
+    `Translate the following assistant answer into ${language}.`,
+    "Preserve meaning, URLs, numbers, names, CRUDX IDs, and formatting.",
+    "Do not add commentary, notes, explanations, Markdown fences, or source labels.",
+    "",
+    text.slice(0, 8000)
+  ].join("\n");
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 1200 }
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error?.message || response.statusText);
+  const translated = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
+  if (!translated) throw new Error("Gemini translation response did not contain text");
+  return translated;
 }
 
 function normalizeToolRequest(rawBody) {
