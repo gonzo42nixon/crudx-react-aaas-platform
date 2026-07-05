@@ -199,6 +199,134 @@ exports.reactAaasInvoke = onRequest(
   }
 );
 
+exports.reactAaasStream = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    secrets: [LANGGRAPH_RUNTIME_TOKEN]
+  },
+  async (req, res) => {
+    setCors(res);
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+      return;
+    }
+
+    const startedAt = new Date().toISOString();
+    const requestBody = typeof req.body === "object" && req.body ? req.body : {};
+    const input = String(requestBody.input || requestBody.query || "").trim();
+    const agentId = String(requestBody.agent_id || requestBody.agentId || "").trim();
+    const okfKey = String(requestBody.okf_key || requestBody.okfKey || "").trim();
+    const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
+    const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
+    const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
+
+    if (!input) {
+      res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
+      return;
+    }
+    if (!okfKey || !CRUDX_ID_RE.test(okfKey)) {
+      res.status(400).json({ ok: false, error: "VALID_OKF_CRUDX_KEY_REQUIRED" });
+      return;
+    }
+    if (!runtimeUrl) {
+      res.status(503).json({ ok: false, error: "LANGGRAPH_RUNTIME_URL_REQUIRED" });
+      return;
+    }
+
+    writeSseHeaders(res);
+    const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
+    const middlewareTrace = [
+      step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey })
+    ];
+    writeSseEvent(res, "trace", middlewareTrace[0]);
+
+    try {
+      const okfEnvelope = await readCrudxEnvelope(okfKey);
+      const okfLoaded = step("crudx", "okf_loaded", { okf_key: okfKey });
+      middlewareTrace.push(okfLoaded);
+      writeSseEvent(res, "trace", okfLoaded);
+
+      const graphResult = await streamStandaloneLangGraphRuntime(runtimeUrl, {
+        run_key: runKey,
+        agent_id: agentId || null,
+        okf_key: okfKey,
+        input,
+        messages,
+        dry_run: dryRun,
+        okf_envelope: okfEnvelope,
+        metadata: {
+          ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
+          source: "gcf-react-aaas-stream",
+          runtime_boundary: "external-langgraph",
+          received_at: startedAt,
+          request_context: buildRequestContext(req, requestBody.metadata?.request_context)
+        }
+      }, (chunk) => res.write(chunk));
+
+      const externalDone = step("langgraph", "external_runtime_completed", {
+        runtime_url: runtimeUrl,
+        nodes: graphResult.graph?.nodes || []
+      });
+      middlewareTrace.push(externalDone);
+      writeSseEvent(res, "trace", externalDone);
+
+      const agent = graphResult.agent || unwrapOkfAgent(okfEnvelope, okfKey);
+      const finalAnswer = String(graphResult.answer || graphResult.output || "").trim();
+      const finishedAt = new Date().toISOString();
+      const mergedTrace = [...middlewareTrace, ...(Array.isArray(graphResult.trace) ? graphResult.trace : [])];
+      const runEnvelope = {
+        schema: "crudx.react_aaas.run.v1",
+        key: runKey,
+        type: "react_aaas_run",
+        status: "completed",
+        created_at: startedAt,
+        updated_at: finishedAt,
+        okf_key: okfKey,
+        agent_id: agent.agent_id || agentId || null,
+        input,
+        messages,
+        output: finalAnswer,
+        response_format: graphResult.response_format || "react_sections_v1",
+        graph: graphResult.graph || null,
+        trace: mergedTrace,
+        langsmith: graphResult.langsmith || null,
+        llm: graphResult.llm || null,
+        runtime: {
+          middleware: "gcf-react-aaas-stream",
+          graph_runtime: "external",
+          graph_runtime_url: runtimeUrl
+        }
+      };
+
+      await writeCrudxEnvelope(runKey, runEnvelope);
+      const persisted = step("crudx", "run_persisted", { run_key: runKey });
+      mergedTrace.push(persisted);
+      writeSseEvent(res, "trace", persisted);
+      writeSseEvent(res, "gcf_completed", {
+        ok: true,
+        run_key: runKey,
+        okf_key: okfKey,
+        agent_id: agent.agent_id || agentId || null
+      });
+    } catch (error) {
+      const failed = step("error", "middleware_failed", { message: error.message });
+      writeSseEvent(res, "trace", failed);
+      writeSseEvent(res, "error", { ok: false, error: error.message || String(error), run_key: runKey });
+    } finally {
+      res.end();
+    }
+  }
+);
+
 exports.translateAnswer = onRequest(
   {
     region: REGION,
@@ -581,6 +709,20 @@ function setCors(res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+}
+
+function writeSseHeaders(res) {
+  res.status(200);
+  res.set("Content-Type", "text/event-stream; charset=utf-8");
+  res.set("Cache-Control", "no-cache, no-transform");
+  res.set("Connection", "keep-alive");
+  res.set("X-Accel-Buffering", "no");
+  res.write(": connected\n\n");
+}
+
+function writeSseEvent(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data ?? null)}\n\n`);
 }
 
 function handlePreflightOrReject(req, res) {
@@ -1178,6 +1320,75 @@ async function invokeStandaloneLangGraphRuntime(runtimeUrl, payload) {
     throw new Error(`External LangGraph runtime failed: ${body.error || response.statusText}`);
   }
   return body;
+}
+
+async function streamStandaloneLangGraphRuntime(runtimeUrl, payload, onChunk) {
+  const token = String(LANGGRAPH_RUNTIME_TOKEN.value() || "");
+  const baseUrl = runtimeUrl.replace(/\/invoke$/i, "");
+  const streamUrl = `${baseUrl}/invoke/stream`;
+  const response = await fetch(streamUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok || !response.body) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`External LangGraph stream failed: ${response.status} ${body.slice(0, 300)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResult = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    onChunk?.(chunk);
+    buffer += chunk;
+    const parts = buffer.split(/\n\n/);
+    buffer = parts.pop() || "";
+    for (const part of parts) {
+      const parsed = parseSseBlock(part);
+      if (parsed.event === "result" && parsed.data) {
+        finalResult = parsed.data;
+      }
+      if (parsed.event === "error" && parsed.data?.error) {
+        throw new Error(parsed.data.error);
+      }
+    }
+  }
+
+  if (!finalResult) {
+    throw new Error("External LangGraph stream finished without result event.");
+  }
+  return finalResult;
+}
+
+function parseSseBlock(block) {
+  const lines = String(block || "").split(/\r?\n/);
+  let event = "message";
+  const dataLines = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  const text = dataLines.join("\n");
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+  return { event, data };
 }
 
 async function invokeLangGraphApiRuntime(runtimeUrl, payload) {

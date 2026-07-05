@@ -37,6 +37,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/invoke/stream") {
+    if (RUNTIME_TOKEN && req.headers.authorization !== `Bearer ${RUNTIME_TOKEN}`) {
+      sendJson(res, 401, { ok: false, error: "UNAUTHORIZED" });
+      return;
+    }
+    await streamGraph(req, res);
+    return;
+  }
+
   if (req.method !== "POST" || url.pathname !== "/invoke") {
     sendJson(res, 404, { ok: false, error: "NOT_FOUND" });
     return;
@@ -65,7 +74,33 @@ if (require.main === module) {
   });
 }
 
-async function invokeGraph(requestBody) {
+async function streamGraph(req, res) {
+  writeSseHeaders(res);
+  const send = (event, data) => writeSseEvent(res, event, data);
+  try {
+    const body = await readJsonBody(req);
+    send("stream_started", { ok: true, at: new Date().toISOString() });
+    const result = await invokeGraph(body, {
+      onTrace: (traceEvent) => send("trace", traceEvent)
+    });
+    send("result", result);
+    send("stream_completed", {
+      ok: true,
+      run_key: result.run_key,
+      at: new Date().toISOString()
+    });
+  } catch (error) {
+    send("error", {
+      ok: false,
+      error: error.message || String(error),
+      at: new Date().toISOString()
+    });
+  } finally {
+    res.end();
+  }
+}
+
+async function invokeGraph(requestBody, options = {}) {
   const startedAt = new Date().toISOString();
   const input = String(requestBody.input || requestBody.query || "").trim();
   const okfKey = String(requestBody.okf_key || requestBody.okfKey || "").trim();
@@ -74,7 +109,8 @@ async function invokeGraph(requestBody) {
   const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
   const okfEnvelope = requestBody.okf_envelope || requestBody.okfEnvelope;
   const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
-  const trace = [step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey })];
+  const trace = createTraceCollector(options.onTrace);
+  trace.push(step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey }));
 
   if (!input) throw new Error("INPUT_REQUIRED");
   if (!okfEnvelope) throw new Error("OKF_ENVELOPE_REQUIRED");
@@ -133,6 +169,23 @@ async function invokeGraph(requestBody) {
     await resolveLangSmithUrls(langsmith);
     throw error;
   }
+}
+
+function createTraceCollector(onTrace) {
+  const trace = [];
+  const nativePush = Array.prototype.push;
+  trace.push = function pushAndEmit(...items) {
+    const length = nativePush.apply(this, items);
+    for (const item of items) {
+      try {
+        onTrace?.(item);
+      } catch {
+        // Streaming observers must never break graph execution.
+      }
+    }
+    return length;
+  };
+  return trace;
 }
 
 function createExternalLangGraph() {
@@ -2542,6 +2595,21 @@ function setCors(res) {
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+function writeSseHeaders(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write(": connected\n\n");
+}
+
+function writeSseEvent(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data ?? null)}\n\n`);
 }
 
 function readJsonBody(req) {
