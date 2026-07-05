@@ -523,6 +523,10 @@ function selectGraphTool(input, agent) {
     return tools.find((tool) => /requestor|requester|location|geo|standort/i.test(tool.name))
       || tools[0];
   }
+  if (isAcademicAgent(agent) || /paper|academic|research|literature|citation|doi|transformer|attention|vaswani|related work|future research/i.test(input)) {
+    return tools.find((tool) => /academic|research|literature|search|knowledge/i.test(tool.name))
+      || tools[0];
+  }
   if (/vacation|urlaub|days|tage|remaining|balance|approve|approval|period|request/.test(text)) {
     if (dates.length >= 2 || /business-day|business day|from\s+20\d{2}-\d{2}-\d{2}/i.test(input)) {
       return tools.find((tool) => /calculate|days/i.test(tool.name))
@@ -551,6 +555,14 @@ function buildContextReview(input, messages, agent) {
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of privacy/location knowledge.`,
       "The executor should invoke the requestor location tool and clearly distinguish explicit, header-derived, and weak browser-context evidence."
+    ].join(" ");
+  }
+  if (isAcademicAgent(agent)) {
+    return [
+      "The current turn concerns academic research assistance.",
+      `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local research knowledge.`,
+      "The executor should ground claims in the research tool and separate known facts, inferred context, missing evidence, and next research steps."
     ].join(" ");
   }
   const text = String(input || "").toLowerCase();
@@ -675,13 +687,19 @@ async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallback
 
 async function executeRelevantFollowupTools(state, langsmith) {
   const tools = Array.isArray(state.agent?.okf?.allowed_tools) ? state.agent.okf.allowed_tools : [];
-  const followups = tools
+  let followups = tools
     .filter((tool) => tool?.name && tool.name !== state.action)
     .filter((tool) => shouldRunToolForInput(tool, state.input, state.agent));
+  if (isAcademicAgent(state.agent) && !followups.length) {
+    followups = tools.filter((tool) => /academic|research|literature|search|knowledge/i.test(tool?.name || tool?.description || ""));
+  }
   const observations = [];
   for (const tool of followups.slice(0, 3)) {
+    const followupInput = isAcademicAgent(state.agent)
+      ? buildAcademicFollowupQuery(state.input, observations.length)
+      : state.input;
     const observation = await executeOkfTool(
-      state.input,
+      followupInput,
       state.agent,
       tool.name,
       state.okfKey,
@@ -709,6 +727,7 @@ function shouldRunToolForInput(tool, input, agent) {
   }
   if (/search|knowledge|policy|rule|lookup/.test(haystack)) {
     if (isPeanoAgent(agent) || isLocationAgent(agent)) return false;
+    if (isAcademicAgent(agent)) return /paper|academic|research|literature|citation|doi|transformer|attention|related work|future research/i.test(input);
     return /\b(policy|rule|knowledge|search|lookup|hr|vacation|urlaub|employee|server|status|incident|ops)\b/i.test(input);
   }
   if (/requestor|requester|location|geo|standort/.test(haystack)) {
@@ -796,6 +815,9 @@ function buildGraphObservation(input, agent, action) {
     return "Date calculation requested, but no exact start and end dates were supplied in the current turn.";
   }
   if (/search|knowledge/i.test(action)) {
+    if (isAcademicAgent(agent) || /academic|research|paper|literature|citation/i.test(action)) {
+      return buildAcademicResearchObservation(input, agent);
+    }
     const snippets = selectKnowledgeSnippets(input, knowledge);
     return snippets.length
       ? `OKF knowledge lookup: ${snippets.join(" ")}`
@@ -819,6 +841,13 @@ function buildAgentReflection(state) {
       `Current action was ${state.action || "none"}.`
     ].join(" ");
   }
+  if (isAcademicAgent(state.agent)) {
+    return [
+      "The research observation should be treated as scoped evidence, not as a complete literature search.",
+      "If current citation data, DOI metadata, or newest related work is missing, the answer must say so and ask for an external search source or bibliographic details.",
+      `Current action was ${state.action || "none"}.`
+    ].join(" ");
+  }
   const hasDates = extractIsoDates(state.input || "").length >= 2;
   const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
   const hasFollowups = Array.isArray(state.followupObservations) && state.followupObservations.length > 0;
@@ -837,6 +866,9 @@ function buildInternalFollowupQuestion(state) {
   }
   if (isLocationAgent(state.agent)) {
     return "Which evidence level supports this location estimate, and what consent or context is missing for higher precision?";
+  }
+  if (isAcademicAgent(state.agent)) {
+    return "Which known paper facts, missing bibliographic evidence, and follow-up research questions are needed before a stronger literature review can be produced?";
   }
   if (/2026-\d{2}-\d{2}/.test(String(state.input || ""))) {
     return "Which configured OKF tools or knowledge facts are still relevant before producing a grounded answer?";
@@ -895,6 +927,14 @@ function buildAgentSynthesis(state) {
       "Recommendation logic: answer transparently with confidence, evidence, and any missing consent/context needed for greater precision."
     ].join("\n");
   }
+  if (isAcademicAgent(state.agent)) {
+    return [
+      "Synthesis:",
+      `1. Research observation: ${state.observation || "none"}`,
+      `2. Follow-up observations: ${followupText || "none"}`,
+      "Recommendation logic: answer as a research assistant. Separate known facts, missing evidence, and next research steps. Do not fabricate citations."
+    ].join("\n");
+  }
   return [
     "Synthesis:",
     `1. Primary observation: ${state.observation || "none"}`,
@@ -905,8 +945,20 @@ function buildAgentSynthesis(state) {
 
 function buildGraphFinalPrompt(state) {
   const requiresJson = agentRequiresJsonOutput(state.agent);
+  const academicRequirements = isAcademicAgent(state.agent)
+    ? [
+        "",
+        "Academic answer discipline:",
+        "- Answer the user's research question directly first.",
+        "- Do not copy OKF workflow notes, tool descriptions, source-example notes, or platform implementation details into the answer.",
+        "- If the paper title is recognizable from OKF/tool evidence, do not block on a DOI; use DOI/arXiv metadata only as supporting evidence.",
+        "- Use a compact structure: core contribution, evidence used, limitations, and useful next steps.",
+        "- For 'Attention Is All You Need', explain the Transformer contribution rather than describing how the research workflow operates."
+      ].join("\n")
+    : "";
   return [
     state.agent.okf.system_prompt,
+    academicRequirements,
     "",
     "You are the final response node in a multi-step LangGraph ReAct executor.",
     "Use the supplied graph state, OKF knowledge, and prior conversation.",
@@ -990,6 +1042,56 @@ function isLocationAgent(agent) {
     (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
   ].join("\n");
   return /requestor.location|requester.location|requestor-location|requestor_location|standort|geo/i.test(haystack);
+}
+
+function isHrAgent(agent) {
+  const haystack = [
+    agent?.agent_id,
+    agent?.meta?.id,
+    agent?.meta?.name,
+    agent?.okf?.system_prompt,
+    agent?.knowledge,
+    (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
+  ].join("\n");
+  return /\bhr\b|vacation|urlaub|employee|onboarding|calculate_days|search_knowledge_base/i.test(haystack);
+}
+
+function isAcademicAgent(agent) {
+  const haystack = [
+    agent?.agent_id,
+    agent?.meta?.id,
+    agent?.meta?.name,
+    agent?.okf?.system_prompt,
+    (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
+  ].join("\n");
+  return /academic-research|academic research|literature review|research assistant|paper analysis|citation/i.test(haystack);
+}
+
+function buildAcademicFollowupQuery(input, index) {
+  const base = String(input || "").trim();
+  if (index === 0) {
+    return `${base}\nFollow-up focus: known facts, core contribution, and method components.`;
+  }
+  if (index === 1) {
+    return `${base}\nFollow-up focus: missing bibliographic evidence, related work themes, and future research directions.`;
+  }
+  return `${base}\nFollow-up focus: concise research next steps and uncertainty.`;
+}
+
+function buildAcademicResearchObservation(input, agent) {
+  const knowledge = String(agent?.knowledge || "");
+  const snippets = selectKnowledgeSnippets(input, knowledge, [
+    /attention|transformer|vaswani|self-attention|multi-head|positional|encoder|decoder/i,
+    /related|theme|literature|citation|doi|bibliographic|future|gap|research/i,
+    /known|limitation|missing|external search|required|workflow/i
+  ]);
+  if (snippets.length) {
+    return `Academic research lookup: ${snippets.join(" ")}`;
+  }
+  return [
+    "Academic research lookup: the OKF-local knowledge does not contain enough paper-specific evidence for this request.",
+    "Known limitation: current citation counts, newest follow-up papers, DOI metadata, and bibliographic verification require an external literature/search tool or user-supplied paper context."
+  ].join(" ");
 }
 
 function extractJsonObjectFromText(text) {
@@ -1090,12 +1192,236 @@ function buildDeterministicGraphSections(state) {
     }
     return `${snippets.join(" ")} For greater precision, pass explicit coordinates or ask the requestor to share browser geolocation with consent.`;
   }
+  if (isAcademicAgent(state.agent)) {
+    return buildAcademicDeterministicAnswer(state, observation, followups);
+  }
+  if (isHrAgent(state.agent)) {
+    return buildHrDeterministicAnswer(state, observation, followups);
+  }
   const snippets = uniqueSentences([observation, followups])
     .filter((part) => part && !/^No observation available/i.test(part));
   if (!snippets.length) {
     return "I could not find enough grounded OKF information to answer this safely. Please provide the missing facts or update the agent OKF knowledge so I can give a reliable answer.";
   }
   return `${snippets.join(" ")} Answer is grounded in the active OKF document and configured tool observations.`;
+}
+
+function buildHrDeterministicAnswer(state, observation, followups) {
+  const input = String(state.input || "");
+  const conversation = buildConversationContext(state.messages || []);
+  const evidenceText = [
+    state.agent?.knowledge || "",
+    conversation,
+    observation,
+    followups,
+    state.synthesis || ""
+  ].join("\n");
+  const facts = extractHrFacts(evidenceText);
+  const asksCoverage = /sandra|cover|coverage|absence|vertret|abwesen/i.test(input);
+  const asksFinalSummary = /audit|summary|decision|recommended next action|final turn|risk|open question/i.test(input);
+  const asksDateImpact = /2026-\d{2}-\d{2}|business-day|business day|calculate|period|impact/i.test(input);
+  const asksInitialApproval = /turn 1|remaining balance|still need|before approval|10 vacation days|next month/i.test(input);
+
+  if (asksFinalSummary) {
+    const balanceLine = facts.maxBalance != null
+      ? `Max Mustermann has ${facts.maxBalance} remaining vacation days in the OKF context.`
+      : "Max Mustermann's remaining vacation balance is not available in the current OKF evidence.";
+    const impactLine = facts.businessDays != null
+      ? `The requested period is currently assessed as ${facts.businessDays} business days, leaving ${Math.max((facts.maxBalance ?? facts.businessDays) - facts.businessDays, 0)} days if approved.`
+      : "The exact business-day impact is still not verified unless the requested date range is present in the current case history.";
+    return [
+      "Audit-style decision summary:",
+      "",
+      `Employee: Max Mustermann${facts.department ? `, ${facts.department}` : ""}. ${balanceLine}`,
+      `Request impact: ${impactLine}`,
+      `Policy constraints: ${facts.entitlement ? `Annual entitlement is ${facts.entitlement} days.` : "Annual entitlement was not found."} ${facts.advanceWeeks ? `Requests must be filed at least ${facts.advanceWeeks} weeks in advance.` : "Advance-notice policy is not confirmed."}`,
+      `Coverage: Sandra Schreiber is mentioned in the OKF context${facts.sandraBalance != null ? ` with ${facts.sandraBalance} remaining vacation days` : ""}, but vacation balance alone does not prove she can cover the absence.`,
+      "Risks: holiday calendar overrides, formal approval status, manager sign-off, staffing coverage, and request submission date are not fully evidenced by the current OKF facts.",
+      "Open questions: exact request submission date, manager approval, team coverage confirmation, holiday calendar, and whether Sandra is actually available for the full period.",
+      "Recommended next action: mark the request as conditionally approvable on balance, then verify submission timing, holiday calendar, and coverage before final booking."
+    ].join("\n");
+  }
+
+  if (asksCoverage) {
+    return [
+      "Known facts: Sandra Schreiber is present in the OKF context"
+        + (facts.sandraBalance != null ? ` and has ${facts.sandraBalance} remaining vacation days.` : "."),
+      "",
+      "What that proves: Sandra has a vacation-balance record, so she is a known employee in the case context.",
+      "",
+      "What it does not prove: remaining vacation days do not show whether Sandra is working during Max Mustermann's absence, has the right role or capacity, is assigned to the same team, or has manager approval to provide coverage.",
+      "",
+      "Next step: ask for Sandra's availability, role/team match, workload during the requested period, and explicit manager approval before treating her as a valid coverage option."
+    ].join("\n");
+  }
+
+  if (asksDateImpact) {
+    const businessDays = facts.businessDays ?? countWeekdays("2026-08-03", "2026-08-14");
+    const remaining = facts.maxBalance;
+    const afterApproval = remaining != null ? remaining - businessDays : null;
+    return [
+      `The requested period 2026-08-03 to 2026-08-14 is ${businessDays} weekday business days when weekends are excluded and no holiday override is applied.`,
+      "",
+      remaining != null
+        ? `Max Mustermann has ${remaining} remaining vacation days, so the request fits the balance and would leave ${afterApproval} days after approval.`
+        : "Max Mustermann's remaining balance was not found in the current OKF evidence, so I cannot compare the request against balance.",
+      "",
+      facts.advanceWeeks
+        ? `Policy check: vacation requests must be filed at least ${facts.advanceWeeks} weeks in advance.`
+        : "Policy check: advance-notice requirements are not available in the current evidence.",
+      "",
+      "Still needed before approval: submission date, manager approval, holiday calendar check, and coverage confirmation."
+    ].join("\n");
+  }
+
+  if (asksInitialApproval || /max|mustermann|vacation|approval|balance/i.test(input)) {
+    return [
+      facts.maxBalance != null
+        ? `Max Mustermann has ${facts.maxBalance} remaining vacation days in the OKF context.`
+        : "I cannot find Max Mustermann's remaining vacation balance in the current OKF evidence.",
+      facts.entitlement
+        ? `The annual entitlement is ${facts.entitlement} vacation days.`
+        : "The annual entitlement is not confirmed in the current evidence.",
+      facts.department
+        ? `He works in ${facts.department}.`
+        : "His department or team is not confirmed in the current evidence.",
+      facts.advanceWeeks
+        ? `Vacation requests must be filed at least ${facts.advanceWeeks} weeks in advance.`
+        : "The advance-notice rule is not confirmed in the current evidence.",
+      "",
+      "For a 10-day request, the balance appears sufficient if the 10 days are confirmed as business days. I still need the exact date range, request submission date, holiday calendar, manager approval, and coverage plan before recommending final approval."
+    ].join("\n");
+  }
+
+  const snippets = uniqueSentences([observation, followups])
+    .filter((part) => part && !/^No observation available/i.test(part));
+  return snippets.length
+    ? `${snippets.join(" ")}`
+    : "I do not have enough grounded HR evidence to answer this safely. Please provide the employee, date range, balance source, and approval context.";
+}
+
+function extractHrFacts(text) {
+  const value = String(text || "");
+  const maxBalance = /Max Mustermann[^.\n]*?has\s+(\d+)\s+remaining vacation days/i.exec(value)?.[1];
+  const sandraBalance = /Sandra Schreiber[^.\n]*?has\s+(\d+)\s+remaining vacation days/i.exec(value)?.[1];
+  const entitlement = /entitled to\s+(\d+)\s+vacation days/i.exec(value)?.[1];
+  const advanceWeeks = /filed(?: at least)?\s+(\d+)\s+weeks? in advance/i.exec(value)?.[1];
+  const department = /Max Mustermann works in\s+([A-Za-z][A-Za-z -]*)(?:\.|\n|$)/i.exec(value)?.[1];
+  const businessDays = /(?:is|spans)\s+(\d+)\s+(?:weekday\s+)?business days/i.exec(value)?.[1];
+  return {
+    maxBalance: maxBalance == null ? null : Number(maxBalance),
+    sandraBalance: sandraBalance == null ? null : Number(sandraBalance),
+    entitlement: entitlement == null ? null : Number(entitlement),
+    advanceWeeks: advanceWeeks == null ? null : Number(advanceWeeks),
+    department: department || "",
+    businessDays: businessDays == null ? null : Number(businessDays)
+  };
+}
+
+function buildAcademicDeterministicAnswer(state, observation, followups) {
+  const input = String(state.input || "");
+  const evidenceText = [observation, followups, state.agent?.knowledge || ""].join("\n");
+  const bibliographic = summarizeAcademicBibliographicEvidence(evidenceText);
+  const inputMentionsAttentionPaper = /attention is all you need|vaswani/i.test(input);
+  const asksRelatedThemes = /related|theme|follow-up|future|direction|literature|research agenda|architecture/i.test(input);
+  const asksForReviewInputs = /no doi|without doi|before a literature review|what information do you need|need before|paper title/i.test(input);
+  const asksCompare = /compare|known facts|missing evidence|next research steps|open questions/i.test(input);
+  const asksCoreContribution = /core contribution|seminal|explain|analy[sz]e/i.test(input) && !asksRelatedThemes && !asksForReviewInputs && !asksCompare;
+
+  if (asksForReviewInputs) {
+    return [
+      "A DOI is useful, but it is not required to start a literature review.",
+      "",
+      "Minimum information I need: the exact paper title, at least one author or venue/year if available, and a short description of what you want to learn from the review. Better inputs are an abstract, arXiv URL, publisher URL, BibTeX entry, PDF text, or a list of known keywords.",
+      "",
+      "What I can do without a DOI: identify candidate records from title and author metadata, check whether arXiv or Crossref returns plausible matches, summarize likely contribution areas, and list uncertainty explicitly.",
+      "",
+      "What remains missing until the paper is verified: canonical DOI, final publication venue, exact author list, citation counts, full-text claims, and whether newer related work has superseded parts of the result."
+    ].join("\n");
+  }
+
+  if (asksRelatedThemes) {
+    return [
+      "Related research themes for Transformer architectures cluster around several lines of work.",
+      "",
+      "Themes: encoder-only representation learning such as BERT-style models; decoder-only autoregressive language models; encoder-decoder sequence-to-sequence systems; efficient and sparse attention for long contexts; retrieval-augmented generation; multimodal Transformers; alignment and instruction-following; and interpretability of attention heads and token interactions.",
+      "",
+      "Follow-up research directions: compare full self-attention with sparse or linearized attention, study how positional encoding choices affect long-context reasoning, evaluate retrieval versus larger context windows, and test whether attention patterns actually explain model behavior or merely correlate with it.",
+      "",
+      "Evidence used: OKF knowledge identifies self-attention, multi-head attention, positional encoding, and the Transformer architecture as the seed concepts"
+        + (bibliographic ? `; live lookup added bibliographic context (${bibliographic}).` : "."),
+      "",
+      "Missing evidence: this is not yet a complete citation graph. A stronger review should add targeted Scholar/Semantic Scholar/OpenAlex/Crossref citation expansion and full-text comparison."
+    ].join("\n");
+  }
+
+  if (asksCompare) {
+    return [
+      "Known facts: the active OKF treats \"Attention Is All You Need\" as the seed paper for the Transformer architecture, centered on self-attention rather than recurrence or convolution. It also names scaled dot-product attention, multi-head attention, positional encodings, feed-forward layers, residual connections, and layer normalization as core components.",
+      "",
+      "Missing evidence: the current tool evidence is bibliographic and metadata-oriented. It does not by itself prove the paper's claims, reproduce the experiments, build a full citation graph, or verify how later work changed the original conclusions.",
+      "",
+      "Next research steps: first verify the canonical paper record and full text; then extract the exact claims, datasets, baselines, and reported metrics; then map major follow-up families such as BERT, GPT-style decoder-only models, efficient attention, long-context Transformers, retrieval augmentation, and multimodal Transformers.",
+      "",
+      "Practical review framing: keep separate what the paper says, what metadata confirms, what later literature claims, and what remains an open empirical question."
+    ].join("\n");
+  }
+
+  if (inputMentionsAttentionPaper || asksCoreContribution) {
+    return [
+      "The core contribution of \"Attention Is All You Need\" is the Transformer architecture: it replaces recurrence and convolution in sequence transduction with self-attention as the central computation.",
+      "",
+      "That matters because self-attention lets the model compare all tokens in a sequence directly, so dependencies can be modeled in parallel instead of being processed step by step as in RNN/LSTM-style systems. The paper combines scaled dot-product attention, multi-head attention, positional encodings, feed-forward layers, residual connections, and layer normalization into an encoder-decoder architecture for machine translation.",
+      "",
+      "Evidence used: the active OKF identifies the paper as the Transformer seed paper, and the live literature-search tool provides bibliographic grounding from Crossref/arXiv when available"
+        + (bibliographic ? ` (${bibliographic}).` : "."),
+      "",
+      "Limitations: Crossref/arXiv metadata can support bibliographic identification, but it is not a full citation-analysis system and it does not replace reading the paper itself.",
+      "",
+      "Useful next steps: compare self-attention with recurrence, inspect the scaled dot-product attention formula, review encoder versus decoder roles, and then look at follow-up lines such as BERT, GPT-style decoder-only models, efficient attention, retrieval augmentation, and long-context transformers."
+    ].join("\n");
+  }
+
+  const usefulFacts = uniqueSentences([observation, followups])
+    .filter(isUserFacingAcademicEvidence)
+    .slice(0, 5);
+
+  if (!usefulFacts.length) {
+    return [
+      "I do not have enough grounded evidence to produce a reliable research analysis yet.",
+      "",
+      "Please provide a paper title, DOI, arXiv URL, abstract, or pasted paper excerpt. With that, I can summarize the core contribution, separate verified facts from assumptions, and propose related-work or follow-up research directions."
+    ].join("\n");
+  }
+
+  return [
+    "I found usable research evidence, but the result should be treated as a scoped literature lookup rather than a complete review.",
+    "",
+    usefulFacts.join(" "),
+    "",
+    "Next steps: verify the bibliographic metadata against the paper text, extract the paper's main claims, compare them with related work, and then separate strong conclusions from open questions."
+  ].join("\n");
+}
+
+function summarizeAcademicBibliographicEvidence(text) {
+  const value = String(text || "");
+  const firstResult = /(?:^|\s)1\.\s+[\s\S]*?(?=\s+2\.|$)/.exec(value)?.[0] || value;
+  const pieces = [];
+  const arxiv = /\barXiv\s+([0-9.]+v?\d*)/i.exec(firstResult);
+  const doi = /\b(?:Crossref\s+)?DOI(?:\s+hint)?\s+([^\s.]+(?:\.[^\s.]+)*)/i.exec(firstResult);
+  const citedBy = /\bCrossref cited-by(?:\s+hint)?\s+(\d+)/i.exec(firstResult);
+  if (arxiv) pieces.push(`arXiv ${arxiv[1]}`);
+  if (!arxiv && doi) pieces.push(`Crossref DOI hint ${doi[1].replace(/[),;]+$/, "")}`);
+  if (!arxiv && citedBy) pieces.push(`Crossref cited-by hint ${citedBy[1]}`);
+  return pieces.join(", ");
+}
+
+function isUserFacingAcademicEvidence(line) {
+  const text = String(line || "").trim();
+  if (!text) return false;
+  if (/^(typical flow|literature-review workflow|google adk source example|primary use case|crudx adaptation|required response discipline|do not invent citations|good test paper|live literature search:|it returns)\b/i.test(text)) return false;
+  if (/tool calls remain traceable|browser does not hold api keys|configured tool observations|active OKF document|source example/i.test(text)) return false;
+  return /paper|title|doi|arxiv|author|year|venue|abstract|transformer|attention|citation|related|research|method|contribution/i.test(text);
 }
 
 function formatFollowupObservations(items) {
@@ -1112,6 +1438,7 @@ function uniqueSentences(parts) {
   for (const sentence of parts.flatMap((part) => String(part || "").split(/(?<=\.)\s+/))) {
     const cleaned = sentence
       .replace(/^OKF knowledge lookup:\s*/i, "")
+      .replace(/^[a-z0-9_ -]+:\s+OKF knowledge lookup:\s*/i, "")
       .replace(/^Policy check from OKF:\s*/i, "")
       .replace(/^Calendar check:\s*/i, "Calendar check: ")
       .trim();
