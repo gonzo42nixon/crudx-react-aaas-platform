@@ -458,6 +458,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
       graph: "crudx_okf_react_discourse",
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
+      memory_profile: agentMemoryProfile(result.agent),
       history_messages: messages.length,
       discourse_turns: Math.max(0, (result.graphEvents || []).filter((event) => /^agent_|^tool_/.test(event.node || "")).length)
     }
@@ -473,8 +474,10 @@ function unwrapOkfAgent(envelope, fallbackKey) {
   return {
     agent_id: okf.agent_id || okf.meta?.name || fallbackKey,
     meta: okf.meta || {},
+    memory_profile: normalizeMemoryProfile(okf.memory_profile || okf.okf?.memory_profile || okf.meta?.memory_profile || okf.meta?.memory?.profile),
     okf: {
       system_prompt: okf.okf.system_prompt || "You are a careful ReAct agent.",
+      memory_profile: normalizeMemoryProfile(okf.okf.memory_profile || okf.memory_profile || okf.meta?.memory_profile || okf.meta?.memory?.profile),
       llm: {
         provider: okf.okf.llm?.provider || "gemini",
         model: okf.okf.llm?.model || GEMINI_MODEL,
@@ -513,7 +516,8 @@ function buildConversationContext(messages) {
 function buildConversationMemory(messages, agent) {
   if (!Array.isArray(messages) || !messages.length) return "No prior case memory available.";
   const context = buildConversationContext(messages);
-  if (isHrAgent(agent)) {
+  const profile = agentMemoryProfile(agent);
+  if (profile === "hr_case") {
     const facts = extractHrFacts([agent?.knowledge || "", context].join("\n"));
     const memory = [];
     if (/Max Mustermann|max_01/i.test(context)) {
@@ -532,7 +536,7 @@ function buildConversationMemory(messages, agent) {
     }
     return memory.length ? `HR case memory: ${memory.join("; ")}.` : "HR case memory: prior turns exist, but no durable HR facts were extracted.";
   }
-  if (isAcademicAgent(agent)) {
+  if (profile === "academic_review") {
     const title = /"([^"]+)"/.exec(context)?.[1] || "";
     const topics = [];
     if (title) topics.push(`paper_title="${title}"`);
@@ -540,6 +544,12 @@ function buildConversationMemory(messages, agent) {
     if (/related|theme|future|direction/i.test(context)) topics.push("focus=related work and future directions");
     if (/missing evidence|known facts|next research/i.test(context)) topics.push("review_frame=known facts vs missing evidence vs next steps");
     return topics.length ? `Academic case memory: ${topics.join("; ")}.` : "Academic case memory: prior research turns exist, but no durable bibliographic facts were extracted.";
+  }
+  if (profile === "location_context") {
+    return `Requestor-location memory: ${messages.length} prior messages are available. Use them only to resolve the current consent and location-evidence question; do not infer HR, vacation, or academic facts from this memory.`;
+  }
+  if (profile === "peano_logic") {
+    return `Peano logic memory: ${messages.length} prior messages are available. Use prior Peano inputs/results only when the user explicitly refers to them; keep the required JSON output contract.`;
   }
   return `Conversation memory: ${messages.length} prior messages are available. Use them to resolve references such as "this", "that", "the previous request", and "final summary".`;
 }
@@ -1065,6 +1075,7 @@ function agentRequiresJsonOutput(agent) {
 }
 
 function isPeanoAgent(agent) {
+  if (agentMemoryProfile(agent, { legacy: false }) === "peano_logic") return true;
   const haystack = [
     agent?.agent_id,
     agent?.meta?.id,
@@ -1076,6 +1087,7 @@ function isPeanoAgent(agent) {
 }
 
 function isLocationAgent(agent) {
+  if (agentMemoryProfile(agent, { legacy: false }) === "location_context") return true;
   const haystack = [
     agent?.agent_id,
     agent?.meta?.id,
@@ -1087,6 +1099,11 @@ function isLocationAgent(agent) {
 }
 
 function isHrAgent(agent) {
+  if (agentMemoryProfile(agent, { legacy: false }) === "hr_case") return true;
+  return legacyIsHrAgent(agent);
+}
+
+function legacyIsHrAgent(agent) {
   const haystack = [
     agent?.agent_id,
     agent?.meta?.id,
@@ -1099,6 +1116,11 @@ function isHrAgent(agent) {
 }
 
 function isAcademicAgent(agent) {
+  if (agentMemoryProfile(agent, { legacy: false }) === "academic_review") return true;
+  return legacyIsAcademicAgent(agent);
+}
+
+function legacyIsAcademicAgent(agent) {
   const haystack = [
     agent?.agent_id,
     agent?.meta?.id,
@@ -1107,6 +1129,30 @@ function isAcademicAgent(agent) {
     (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
   ].join("\n");
   return /academic-research|academic research|literature review|research assistant|paper analysis|citation/i.test(haystack);
+}
+
+function agentMemoryProfile(agent, options = {}) {
+  const legacy = options.legacy !== false;
+  const explicit = normalizeMemoryProfile(
+    agent?.memory_profile
+      || agent?.okf?.memory_profile
+      || agent?.meta?.memory_profile
+      || agent?.meta?.memory?.profile
+  );
+  if (explicit) return explicit;
+  if (!legacy) return "generic";
+  if (legacyIsHrAgent(agent)) return "hr_case";
+  if (legacyIsAcademicAgent(agent)) return "academic_review";
+  if (isLocationAgent(agent)) return "location_context";
+  if (isPeanoAgent(agent)) return "peano_logic";
+  return "generic";
+}
+
+function normalizeMemoryProfile(value) {
+  const profile = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  return ["hr_case", "academic_review", "location_context", "peano_logic", "generic"].includes(profile)
+    ? profile
+    : "";
 }
 
 function buildAcademicFollowupQuery(input, index) {
