@@ -1204,6 +1204,9 @@ function buildGraphFinalPrompt(state) {
     "Do not use headings named Plan, Dialogue, Evidence, or Final.",
     "Write like a helpful professional assistant speaking to the user.",
     "Mention missing information only when it materially affects the answer.",
+    "Default brevity rule: keep normal answers under 120 words and usually 2-4 sentences.",
+    "Exceed 120 words only when the user explicitly asks for an audit, handoff, detailed comparison, long analysis, or structured report.",
+    "Do not repeat raw tool observations verbatim; synthesize the useful facts.",
     "",
     "Graph state:",
     `Context review: ${state.contextReview || "none"}`,
@@ -1232,7 +1235,7 @@ function buildGraphFinalPrompt(state) {
     "- Do not mention OKF, OKF context, active OKF, graph state, or platform internals in normal user-facing answers.",
     "- When you need to identify the source of a fact, use ordinary language such as 'according to the information available', 'our records show', or 'based on the information provided'.",
     "- LangSmith tracing is handled automatically by the platform. If the user asks for a trace, acknowledge that trace metadata is attached by the platform; do not claim you cannot create traces.",
-    requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer concise, practical, and readable.",
+    requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer short, practical, and readable.",
     "- Do not reveal internal node names unless the user explicitly asks for debugging."
   ].join("\n");
 }
@@ -1248,6 +1251,8 @@ function buildGraphRevisionPrompt(state) {
     "Apply every concrete improvement that is supported by the tool observations, graph synthesis, or prior conversation.",
     "If a critic supplies a better_answer and it is supported by the evidence, use it as the baseline for the final answer.",
     "Preserve grounded facts, exact CRUDX IDs, and exact URLs from the draft or tool observations.",
+    "Default brevity rule: keep the final answer under 120 words and usually 2-4 sentences unless the user explicitly asked for a detailed/audit/handoff/comparison report.",
+    "Prefer a shorter supported critic answer over a longer draft when both are correct.",
     requiresJson
       ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence."
       : "Return only the final user-facing answer. Do not output JSON, Markdown code fences, trace data, or hidden chain-of-thought.",
@@ -1279,7 +1284,8 @@ function buildGraphRevisionPrompt(state) {
     "- Separate known facts, missing evidence, and recommendations where the question asks for it.",
     "- If a critic suggested unsupported facts, ignore them.",
     "- If critics ask for structure, missing-evidence separation, less verbosity, or clearer caveats, implement those changes.",
-    "- Do not keep the draft unchanged unless every critic suggestion is unsupported or harmful."
+    "- Do not keep the draft unchanged unless every critic suggestion is unsupported or harmful.",
+    "- Remove redundant explanation and platform/process wording before returning the final answer."
   ].join("\n");
 }
 
@@ -1382,6 +1388,7 @@ function buildCriticPrompt(state) {
     "You are an independent answer-quality critic for an agent platform.",
     "Review the candidate answer against the user request and the supplied grounded evidence.",
     "Do not invent facts. If the evidence is too thin, say so.",
+    "Prefer concise better_answer text under 120 words unless the user explicitly requested a long report.",
     "Return concise feedback with these sections: score_1_to_10, strengths, issues, concrete_improvements, better_answer.",
     "",
     `Agent: ${state.agent?.meta?.name || state.agent?.agent_id || "unknown"}`,
