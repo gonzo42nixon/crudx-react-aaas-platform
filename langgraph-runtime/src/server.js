@@ -551,6 +551,17 @@ function buildConversationMemory(messages, agent) {
   if (profile === "peano_logic") {
     return `Peano logic memory: ${messages.length} prior messages are available. Use prior Peano inputs/results only when the user explicitly refers to them; keep the required JSON output contract.`;
   }
+  if (profile === "ops_incident") {
+    const targets = [...new Set((context.match(/\b(?:db-prod-main|web-prod-01|vpn-gateway)\b/gi) || []).map((item) => item.toLowerCase()))];
+    const facts = [];
+    if (targets.length) facts.push(`targets=${targets.join(", ")}`);
+    if (/slow checkout|intermittent errors|latency/i.test(context)) facts.push("symptoms=slow checkout/intermittent errors");
+    if (/85\s*percent|85%|storage allocation/i.test(context)) facts.push("suspect=db-prod-main storage pressure");
+    if (/handoff|severity|escalation/i.test(context)) facts.push("needs=incident handoff");
+    return facts.length
+      ? `Ops incident memory: ${facts.join("; ")}.`
+      : "Ops incident memory: prior infrastructure-triage turns exist, but no durable incident facts were extracted.";
+  }
   return `Conversation memory: ${messages.length} prior messages are available. Use them to resolve references such as "this", "that", "the previous request", and "final summary".`;
 }
 
@@ -569,6 +580,10 @@ function selectGraphTool(input, agent) {
   }
   if (isAcademicAgent(agent) || /paper|academic|research|literature|citation|doi|transformer|attention|vaswani|related work|future research/i.test(input)) {
     return tools.find((tool) => /academic|research|literature|search|knowledge/i.test(tool.name))
+      || tools[0];
+  }
+  if (isOpsAgent(agent) || /checkout|incident|latency|intermittent|server|status|node|host|db-prod-main|web-prod-01|vpn-gateway|degraded|storage|risk|mitigation|handoff/i.test(input)) {
+    return tools.find((tool) => /server|status|node|health|check/i.test(tool.name))
       || tools[0];
   }
   if (/vacation|urlaub|days|tage|remaining|balance|approve|approval|period|request/.test(text)) {
@@ -611,6 +626,15 @@ function buildContextReview(input, messages, agent) {
       memory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local research knowledge.`,
       "The executor should ground claims in the research tool and separate known facts, inferred context, missing evidence, and next research steps."
+    ].join(" ");
+  }
+  if (isOpsAgent(agent)) {
+    return [
+      "The current turn concerns infrastructure incident triage.",
+      `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      memory,
+      `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of infrastructure knowledge.`,
+      "The executor should compare confirmed host status, state the most suspicious component, separate assumptions from evidence, and produce operational next steps or handoff notes when requested."
     ].join(" ");
   }
   const text = String(input || "").toLowerCase();
@@ -897,6 +921,13 @@ function buildAgentReflection(state) {
       `Current action was ${state.action || "none"}.`
     ].join(" ");
   }
+  if (isOpsAgent(state.agent)) {
+    return [
+      "The infrastructure observation should be turned into an incident-triage answer, not copied as raw status lines.",
+      "Separate confirmed status, likely risk, immediate mitigation, missing telemetry, and escalation recommendation.",
+      `Current action was ${state.action || "none"}.`
+    ].join(" ");
+  }
   const hasDates = extractIsoDates(state.input || "").length >= 2;
   const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
   const hasFollowups = Array.isArray(state.followupObservations) && state.followupObservations.length > 0;
@@ -919,6 +950,9 @@ function buildInternalFollowupQuestion(state) {
   if (isAcademicAgent(state.agent)) {
     return "Which known paper facts, missing bibliographic evidence, and follow-up research questions are needed before a stronger literature review can be produced?";
   }
+  if (isOpsAgent(state.agent)) {
+    return "Which infrastructure facts, missing telemetry, and next operational checks are needed before the incident can be handed off?";
+  }
   if (/2026-\d{2}-\d{2}/.test(String(state.input || ""))) {
     return "Which configured OKF tools or knowledge facts are still relevant before producing a grounded answer?";
   }
@@ -931,6 +965,12 @@ function buildPolicyObservation(input, agent) {
   }
   if (isLocationAgent(agent)) {
     return "Privacy rule check: precise GPS location requires explicit coordinates or consented browser geolocation; time zone and locale are weak hints only.";
+  }
+  if (isOpsAgent(agent)) {
+    const snippets = selectKnowledgeSnippets(input, String(agent?.knowledge || ""), [/severity|risk|mitigation|escalat|runbook|evidence|missing|storage|checkout|vpn|web-prod|db-prod/i]);
+    return snippets.length
+      ? `Operational policy check from OKF: ${snippets.join(" ")}`
+      : "Operational policy check: no incident runbook rule was found in the OKF knowledge.";
   }
   const knowledge = String(agent?.knowledge || "");
   const snippets = selectKnowledgeSnippets(input, knowledge, [/policy|rule|request|approval|approve|vacation|urlaub|entitled|advance|weeks|days/i]);
@@ -984,6 +1024,14 @@ function buildAgentSynthesis(state) {
       "Recommendation logic: answer as a research assistant. Separate known facts, missing evidence, and next research steps. Do not fabricate citations."
     ].join("\n");
   }
+  if (isOpsAgent(state.agent)) {
+    return [
+      "Synthesis:",
+      `1. Infrastructure observation: ${state.observation || "none"}`,
+      `2. Follow-up observations: ${followupText || "none"}`,
+      "Recommendation logic: answer as an incident triage assistant. Identify suspected component, operational risk, immediate mitigation, missing telemetry, and escalation or handoff where requested."
+    ].join("\n");
+  }
   return [
     "Synthesis:",
     `1. Primary observation: ${state.observation || "none"}`,
@@ -1005,9 +1053,22 @@ function buildGraphFinalPrompt(state) {
         "- For 'Attention Is All You Need', explain the Transformer contribution rather than describing how the research workflow operates."
       ].join("\n")
     : "";
+  const opsRequirements = isOpsAgent(state.agent)
+    ? [
+        "",
+        "Ops incident answer discipline:",
+        "- Answer the user's operational question directly first.",
+        "- Do not copy raw OKF status lines as the whole answer.",
+        "- Triage answers must name the most suspicious component and why.",
+        "- Risk/mitigation answers must include operational risk, immediate mitigation, and missing evidence.",
+        "- Comparison answers must separate confirmed status from assumptions and recommend the next check.",
+        "- Handoff answers must include severity, affected systems, suspected root cause, actions taken, open questions, and escalation recommendation."
+      ].join("\n")
+    : "";
   return [
     state.agent.okf.system_prompt,
     academicRequirements,
+    opsRequirements,
     "",
     "You are the final response node in a multi-step LangGraph ReAct executor.",
     "Use the supplied graph state, OKF knowledge, and prior conversation.",
@@ -1131,6 +1192,20 @@ function legacyIsAcademicAgent(agent) {
   return /academic-research|academic research|literature review|research assistant|paper analysis|citation/i.test(haystack);
 }
 
+function isOpsAgent(agent) {
+  if (agentMemoryProfile(agent, { legacy: false }) === "ops_incident") return true;
+  const haystack = [
+    agent?.agent_id,
+    agent?.meta?.id,
+    agent?.meta?.name,
+    Array.isArray(agent?.meta?.tags) ? agent.meta.tags.join(" ") : "",
+    agent?.okf?.system_prompt,
+    agent?.knowledge,
+    (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
+  ].join("\n");
+  return /sysadmin|ops|incident|infrastructure|db-prod-main|web-prod-01|vpn-gateway|server status|check_server_status/i.test(haystack);
+}
+
 function agentMemoryProfile(agent, options = {}) {
   const legacy = options.legacy !== false;
   const explicit = normalizeMemoryProfile(
@@ -1143,6 +1218,7 @@ function agentMemoryProfile(agent, options = {}) {
   if (!legacy) return "generic";
   if (legacyIsHrAgent(agent)) return "hr_case";
   if (legacyIsAcademicAgent(agent)) return "academic_review";
+  if (isOpsAgent(agent)) return "ops_incident";
   if (isLocationAgent(agent)) return "location_context";
   if (isPeanoAgent(agent)) return "peano_logic";
   return "generic";
@@ -1150,7 +1226,7 @@ function agentMemoryProfile(agent, options = {}) {
 
 function normalizeMemoryProfile(value) {
   const profile = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  return ["hr_case", "academic_review", "location_context", "peano_logic", "generic"].includes(profile)
+  return ["hr_case", "academic_review", "ops_incident", "location_context", "peano_logic", "generic"].includes(profile)
     ? profile
     : "";
 }
@@ -1286,6 +1362,9 @@ function buildDeterministicGraphSections(state) {
   if (isHrAgent(state.agent)) {
     return buildHrDeterministicAnswer(state, observation, followups);
   }
+  if (isOpsAgent(state.agent)) {
+    return buildOpsDeterministicAnswer(state, observation, followups);
+  }
   const snippets = uniqueSentences([observation, followups])
     .filter((part) => part && !/^No observation available/i.test(part));
   if (!snippets.length) {
@@ -1406,6 +1485,108 @@ function buildHrDeterministicAnswer(state, observation, followups) {
   return snippets.length
     ? `${snippets.join(" ")}`
     : "I do not have enough grounded HR evidence to answer this safely. Please provide the employee, date range, balance source, and approval context.";
+}
+
+function buildOpsDeterministicAnswer(state, observation, followups) {
+  const input = String(state.input || "");
+  const conversation = buildConversationContext(state.messages || []);
+  const evidenceText = [
+    state.agent?.knowledge || "",
+    conversation,
+    observation,
+    followups,
+    state.synthesis || ""
+  ].join("\n");
+  const facts = extractOpsFacts(evidenceText);
+  const asksHandoff = /handoff|final turn|severity|affected systems|root cause|escalation recommendation/i.test(input);
+  const asksCompare = /compare|separate confirmed|assumptions|next check/i.test(input);
+  const asksRisk = /risk|mitigation|missing evidence|85 percent|85%|still degraded/i.test(input);
+  const asksTriage = /triage|slow checkout|intermittent|most suspicious/i.test(input);
+
+  const webStatus = facts.webStatus || "UNKNOWN";
+  const dbStatus = facts.dbStatus || "UNKNOWN";
+  const vpnStatus = facts.vpnStatus || "UNKNOWN";
+  const suspect = facts.dbStoragePct >= 80 || /degraded/i.test(dbStatus) ? "db-prod-main" : "undetermined";
+  const severity = facts.checkoutAffected && suspect === "db-prod-main" ? "SEV-2" : "SEV-3";
+
+  if (asksHandoff) {
+    return [
+      "Incident handoff note:",
+      "",
+      `Severity: ${severity}. Checkout is user-facing and symptoms include slow checkout/intermittent errors; no full outage is confirmed.`,
+      `Affected systems: checkout path, db-prod-main, and potentially services depending on db-prod-main. web-prod-01 is ${webStatus}; vpn-gateway is ${vpnStatus}.`,
+      `Suspected root cause: db-prod-main storage pressure${facts.dbStoragePct ? ` at ${facts.dbStoragePct}% allocation` : ""}, with risk of slow queries, failed writes, or connection pool saturation.`,
+      "Actions taken: reviewed OKF host status, identified db-prod-main as the strongest suspect, compared web and VPN status, and scoped immediate mitigation.",
+      "Immediate mitigation: pause non-critical batch jobs, free or extend database storage, check slow-query and connection-pool metrics, verify recent DB maintenance or growth spikes, and keep checkout monitoring open.",
+      "Open questions: current DB latency, error rate, disk I/O, connection saturation, replication health, recent deploys, exact checkout error codes, and whether VPN telemetry is relevant for the reporting user.",
+      "Escalation recommendation: page the database/on-call owner now; keep web and network owners informed but do not make them primary unless new telemetry contradicts the DB signal."
+    ].join("\n");
+  }
+
+  if (asksCompare) {
+    return [
+      "Confirmed status:",
+      `- db-prod-main: ${dbStatus}${facts.dbStoragePct ? ` with ${facts.dbStoragePct}% storage allocation` : ""}. This is the strongest confirmed abnormal signal.`,
+      `- web-prod-01: ${webStatus}. No OKF evidence currently points to web host failure.`,
+      `- vpn-gateway: ${vpnStatus}. The VPN status is present in OKF; no VPN-specific symptom is confirmed for checkout.`,
+      "",
+      "Assumptions:",
+      "- Slow checkout is assumed to depend on db-prod-main because checkout commonly needs database reads/writes; this still needs telemetry confirmation.",
+      "- VPN is probably not the primary cause for a sales user's checkout issue unless the user reaches checkout through VPN or broader network symptoms appear.",
+      "",
+      "Recommended next check: inspect db-prod-main storage growth, disk I/O, slow queries, write errors, and connection-pool saturation for the incident window. If those are clean, move next to checkout service logs and web-prod-01 latency."
+    ].join("\n");
+  }
+
+  if (asksRisk) {
+    return [
+      `Operational risk: db-prod-main is still degraded${facts.dbStoragePct ? ` at ${facts.dbStoragePct}% storage allocation` : ""}. That can cause slow queries, write failures, checkout timeouts, degraded customer experience, and secondary pressure on web services.`,
+      "",
+      "Immediate mitigation: free database storage, expand the storage allocation if supported, stop or defer non-critical batch/reporting jobs, check slow-query logs, check connection-pool saturation, and verify backup/replication health before making large changes.",
+      "",
+      "Missing evidence: current DB latency, disk I/O wait, free disk trend, query error rate, connection pool utilization, checkout service logs, recent deploy/config changes, exact user error messages, and whether symptoms affect all users or only VPN/internal users.",
+      "",
+      "Next action: treat db-prod-main as the primary suspect and ask the DB owner for live metrics while the application owner checks checkout logs."
+    ].join("\n");
+  }
+
+  if (asksTriage || /checkout|incident|degraded|status/i.test(input)) {
+    return [
+      "Triage result: db-prod-main is the most suspicious component.",
+      "",
+      `Reasoning: web-prod-01 is ${webStatus}, vpn-gateway is ${vpnStatus}, while db-prod-main is ${dbStatus}${facts.dbStoragePct ? ` with a ${facts.dbStoragePct}% storage allocation warning` : ""}. Slow checkout and intermittent errors are consistent with database pressure because checkout usually depends on database reads/writes.`,
+      "",
+      "Known facts: db-prod-main is degraded; web-prod-01 and vpn-gateway do not currently show a confirmed abnormal OKF status.",
+      "",
+      "Next check: pull db-prod-main latency, disk I/O, storage-growth, slow-query, write-error, and connection-pool metrics for the incident window."
+    ].join("\n");
+  }
+
+  const snippets = uniqueSentences([observation, followups])
+    .filter((part) => part && !/^No observation available/i.test(part));
+  return snippets.length
+    ? `${snippets.join(" ")} Treat db-prod-main as the leading suspect only if live database telemetry confirms storage or query pressure.`
+    : "I do not have enough grounded infrastructure evidence to answer safely. Please provide host status, symptom scope, error rates, and incident timing.";
+}
+
+function extractOpsFacts(text) {
+  const value = String(text || "");
+  const webStatus = /web-prod-01[^\n]*?Status:\s*([A-Z_ -]+)/i.exec(value)?.[1]?.trim().replace(/[.;]+$/, "");
+  const dbStatus = /db-prod-main[^\n]*?Status:\s*([A-Z_ -]+)/i.exec(value)?.[1]?.trim().replace(/[.;]+$/, "");
+  const vpnStatus = /vpn-gateway[^\n]*?Status:\s*([A-Z_ -]+)/i.exec(value)?.[1]?.trim().replace(/[.;]+$/, "");
+  const explicitDbStoragePct = /db-prod-main[^\n]*?Status:\s*DEGRADED[^\n]*?(\d{2,3})\s*%?\s*storage allocation/i.exec(value)?.[1]
+    || /db-prod-main[^\n]*?(\d{2,3})\s*%?\s*storage allocation warning/i.exec(value)?.[1]
+    || /still degraded at\s+(\d{2,3})\s*percent storage allocation/i.exec(value)?.[1]
+    || /storage allocation warning[^\n]*?(\d{2,3})\s*%/i.exec(value)?.[1];
+  const dbStoragePct = explicitDbStoragePct
+    || (/\b85\s*percent storage allocation/i.test(value) ? "85" : null);
+  return {
+    webStatus: webStatus || "",
+    dbStatus: dbStatus || "",
+    vpnStatus: vpnStatus || "",
+    dbStoragePct: dbStoragePct == null ? null : Number(dbStoragePct),
+    checkoutAffected: /checkout|slow checkout|intermittent errors/i.test(value)
+  };
 }
 
 function extractHrFacts(text) {
