@@ -14,7 +14,6 @@ const LANGGRAPH_RUNTIME_MODE = defineString("LANGGRAPH_RUNTIME_MODE", { default:
 const LANGGRAPH_ASSISTANT_ID = defineString("LANGGRAPH_ASSISTANT_ID", { default: "agent" });
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
-const CRUDX_TIMELINE_TAG = "Created>2026>07>05";
 const CRUDX_OWNER = "drueffler@gmail.com";
 
 exports.reactAaasInvoke = onRequest(
@@ -571,7 +570,7 @@ async function writeCrudxEnvelope(key, envelope) {
       "run",
       "trace",
       "crudx-gcf",
-      CRUDX_TIMELINE_TAG,
+      createdTimelineTag(),
       `agent:${envelope.agent_id || "unknown"}`,
       envelope.okf_key ? `okf:${envelope.okf_key}` : null,
       envelope.langsmith?.trace_id ? "langsmith" : null,
@@ -589,6 +588,17 @@ async function writeCrudxEnvelope(key, envelope) {
   if (!response.ok || body.ok === false) {
     throw new Error(`CRUDX write failed for ${key}: ${body.error || response.statusText}`);
   }
+}
+
+function createdTimelineTag(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Berlin",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `Created>${byType.year}>${byType.month}>${byType.day}`;
 }
 
 function unwrapCrudxDoc(doc) {
