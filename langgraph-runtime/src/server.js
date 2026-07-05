@@ -242,7 +242,7 @@ function createExternalLangGraph() {
                 : isLocationAgent(state.agent)
                   ? `Start with ${selectedTool.name}, classify the evidence level, then produce a privacy-aware location estimate.`
                 : `Start with ${selectedTool.name}, then evaluate only relevant OKF follow-up tools before producing the final response.`
-              : "Answer from the OKF context without invoking a configured tool.",
+              : "Answer from the available information without invoking a configured tool.",
             action: selectedTool?.name || "none"
           };
         },
@@ -981,7 +981,7 @@ function isHttpUrl(value) {
 function buildGraphObservation(input, agent, action) {
   const knowledge = String(agent?.knowledge || "");
   const text = String(input || "").toLowerCase();
-  if (action === "none") return "No configured tool was selected; answer from OKF context and prior conversation.";
+  if (action === "none") return "No configured tool was selected; answer from the available information and prior conversation.";
   const dates = extractIsoDates(input);
   if (/calculate|days/i.test(action) || dates.length >= 2 || /business-day|business day/.test(text)) {
     if (dates.length >= 2) {
@@ -1220,7 +1220,8 @@ function buildGraphFinalPrompt(state) {
     "Final response requirements:",
     "- Use prior conversation when relevant.",
     "- Separate known facts from missing information.",
-    "- If facts come from OKF, simply say they are in the OKF context when useful.",
+    "- Do not mention OKF, OKF context, active OKF, graph state, or platform internals in normal user-facing answers.",
+    "- When you need to identify the source of a fact, use ordinary language such as 'according to the information available', 'our records show', or 'based on the information provided'.",
     "- LangSmith tracing is handled automatically by the platform. If the user asks for a trace, acknowledge that trace metadata is attached by the platform; do not claim you cannot create traces.",
     requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer concise, practical, and readable.",
     "- Do not reveal internal node names unless the user explicitly asks for debugging."
@@ -1522,7 +1523,32 @@ function normalizeGraphFinalAnswer(text, state) {
   if (isLocationAgent(state.agent) && /https:\/\/www\.google\.com\/maps\/dir\//i.test([state.observation, state.synthesis].join("\n")) && !/https:\/\/www\.google\.com\/maps\/dir\//i.test(withoutFences)) {
     return buildDeterministicGraphSections(state);
   }
-  return looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
+  const answer = looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
+  return humanizeUserFacingPlatformLanguage(answer);
+}
+
+function humanizeUserFacingPlatformLanguage(value) {
+  return String(value || "")
+    .replace(/\bin the OKF context\b/gi, "according to the information available")
+    .replace(/\bfrom the OKF context\b/gi, "from the available information")
+    .replace(/\bthe OKF context\b/gi, "the available information")
+    .replace(/\bactive OKF document\b/gi, "available records")
+    .replace(/\bactive OKF\b/gi, "available records")
+    .replace(/\bOKF document\b/gi, "available records")
+    .replace(/\bOKF knowledge base\b/gi, "available records")
+    .replace(/\bOKF evidence\b/gi, "available evidence")
+    .replace(/\bOKF facts\b/gi, "available facts")
+    .replace(/\bOKF status\b/gi, "available status information")
+    .replace(/\bOKF-local knowledge\b/gi, "available local knowledge")
+    .replace(/\bOKF knowledge\b/gi, "available information")
+    .replace(/\bOKF information\b/gi, "available information")
+    .replace(/\bOKF context\b/gi, "available information")
+    .replace(/\bconfigured tool observations\b/gi, "tool results")
+    .replace(/\bAnswer is grounded in available records and tool results\./gi, "This answer is based on the information available.")
+    .replace(/\bAnswer is grounded in the available records and tool results\./gi, "This answer is based on the information available.")
+    .replace(/\baccording to the information available\./gi, "according to the information available.")
+    .replace(/\s+\n/g, "\n")
+    .trim();
 }
 
 function agentRequiresJsonOutput(agent) {
@@ -1767,9 +1793,9 @@ function buildDeterministicGraphSections(state) {
   const snippets = uniqueSentences([observation, followups])
     .filter((part) => part && !/^No observation available/i.test(part));
   if (!snippets.length) {
-    return "I could not find enough grounded OKF information to answer this safely. Please provide the missing facts or update the agent OKF knowledge so I can give a reliable answer.";
+    return "I could not find enough reliable information to answer this safely. Please provide the missing facts or update the agent records so I can give a reliable answer.";
   }
-  return `${snippets.join(" ")} Answer is grounded in the active OKF document and configured tool observations.`;
+  return `${snippets.join(" ")} This answer is based on the information available.`;
 }
 
 function buildHrDeterministicAnswer(state, observation, followups) {
@@ -1790,8 +1816,8 @@ function buildHrDeterministicAnswer(state, observation, followups) {
 
   if (asksFinalSummary) {
     const balanceLine = facts.maxBalance != null
-      ? `Max Mustermann has ${facts.maxBalance} remaining vacation days in the OKF context.`
-      : "Max Mustermann's remaining vacation balance is not available in the current OKF evidence.";
+      ? `Our records show that Max Mustermann has ${facts.maxBalance} remaining vacation days.`
+      : "Max Mustermann's remaining vacation balance is not available in the current evidence.";
     const impactLine = facts.businessDays != null
       ? `The requested period is currently assessed as ${facts.businessDays} business days, leaving ${Math.max((facts.maxBalance ?? facts.businessDays) - facts.businessDays, 0)} days if approved.`
       : "The exact business-day impact is still not verified unless the requested date range is present in the current case history.";
@@ -1802,11 +1828,11 @@ function buildHrDeterministicAnswer(state, observation, followups) {
       `Request impact: ${impactLine}`,
       `Policy constraints: ${facts.entitlement ? `Annual entitlement is ${facts.entitlement} days.` : "Annual entitlement was not found."} ${facts.advanceWeeks ? `Requests must be filed at least ${facts.advanceWeeks} weeks in advance.` : "Advance-notice policy is not confirmed."}`,
       facts.coverageApproved
-        ? `Coverage: Sandra Schreiber can cover the absence. OKF evidence says she is in ${facts.sandraDepartment || "the relevant team"}, has ${facts.sandraBalance ?? "a recorded"} remaining vacation days, is available for the requested period, and is approved as deputy for Max Mustermann.`
-        : `Coverage: Sandra Schreiber is mentioned in the OKF context${facts.sandraBalance != null ? ` with ${facts.sandraBalance} remaining vacation days` : ""}, but the current evidence does not fully prove she can cover the absence.`,
+        ? `Coverage: Sandra Schreiber can cover the absence. The available evidence says she is in ${facts.sandraDepartment || "the relevant team"}, has ${facts.sandraBalance ?? "a recorded"} remaining vacation days, is available for the requested period, and is approved as deputy for Max Mustermann.`
+        : `Coverage: Sandra Schreiber is mentioned in the available records${facts.sandraBalance != null ? ` with ${facts.sandraBalance} remaining vacation days` : ""}, but the current evidence does not fully prove she can cover the absence.`,
       facts.coverageApproved
         ? "Risks: remaining checks are administrative rather than coverage-related: holiday calendar overrides, formal approval status, manager sign-off record, and request submission date."
-        : "Risks: holiday calendar overrides, formal approval status, manager sign-off, staffing coverage, and request submission date are not fully evidenced by the current OKF facts.",
+        : "Risks: holiday calendar overrides, formal approval status, manager sign-off, staffing coverage, and request submission date are not fully evidenced by the current facts.",
       facts.coverageApproved
         ? "Open questions: exact request submission date, holiday calendar confirmation, and formal booking/approval record."
         : "Open questions: exact request submission date, manager approval, team coverage confirmation, holiday calendar, and whether Sandra is actually available for the full period.",
@@ -1819,10 +1845,10 @@ function buildHrDeterministicAnswer(state, observation, followups) {
   if (asksCoverage) {
     if (facts.coverageApproved) {
       return [
-        "Known facts: Sandra Schreiber is a known employee in the OKF context"
+        "Known facts: Sandra Schreiber is listed in the available records"
           + (facts.sandraDepartment ? ` and works in ${facts.sandraDepartment}.` : "."),
-        facts.sandraBalance != null ? `She has ${facts.sandraBalance} remaining vacation days.` : "Her remaining vacation balance is recorded in the OKF context.",
-        "The OKF states that she is available during 2026-08-03 to 2026-08-14, has no conflicting approved absence in that period, and is approved as deputy coverage for Max Mustermann's Sales responsibilities.",
+        facts.sandraBalance != null ? `She has ${facts.sandraBalance} remaining vacation days.` : "Her remaining vacation balance is recorded in the available records.",
+        "The available records state that she is available during 2026-08-03 to 2026-08-14, has no conflicting approved absence in that period, and is approved as deputy coverage for Max Mustermann's Sales responsibilities.",
         "",
         "Coverage decision: Sandra Schreiber can cover Max Mustermann's absence for the requested period.",
         "",
@@ -1830,7 +1856,7 @@ function buildHrDeterministicAnswer(state, observation, followups) {
       ].join("\n");
     }
     return [
-      "Known facts: Sandra Schreiber is present in the OKF context"
+      "Known facts: Sandra Schreiber is present in the available records"
         + (facts.sandraBalance != null ? ` and has ${facts.sandraBalance} remaining vacation days.` : "."),
       "",
       "What that proves: Sandra has a vacation-balance record, so she is a known employee in the case context.",
@@ -1850,7 +1876,7 @@ function buildHrDeterministicAnswer(state, observation, followups) {
       "",
       remaining != null
         ? `Max Mustermann has ${remaining} remaining vacation days, so the request fits the balance and would leave ${afterApproval} days after approval.`
-        : "Max Mustermann's remaining balance was not found in the current OKF evidence, so I cannot compare the request against balance.",
+        : "Max Mustermann's remaining balance was not found in the current evidence, so I cannot compare the request against balance.",
       "",
       facts.advanceWeeks
         ? `Policy check: vacation requests must be filed at least ${facts.advanceWeeks} weeks in advance.`
@@ -1863,8 +1889,8 @@ function buildHrDeterministicAnswer(state, observation, followups) {
   if (asksInitialApproval || /max|mustermann|vacation|approval|balance/i.test(input)) {
     return [
       facts.maxBalance != null
-        ? `Max Mustermann has ${facts.maxBalance} remaining vacation days in the OKF context.`
-        : "I cannot find Max Mustermann's remaining vacation balance in the current OKF evidence.",
+        ? `Our records show that Max Mustermann has ${facts.maxBalance} remaining vacation days.`
+        : "I cannot find Max Mustermann's remaining vacation balance in the current evidence.",
       facts.entitlement
         ? `The annual entitlement is ${facts.entitlement} vacation days.`
         : "The annual entitlement is not confirmed in the current evidence.",
@@ -1915,7 +1941,7 @@ function buildOpsDeterministicAnswer(state, observation, followups) {
       `Severity: ${severity}. Checkout is user-facing and symptoms include slow checkout/intermittent errors; no full outage is confirmed.`,
       `Affected systems: checkout path, db-prod-main, and potentially services depending on db-prod-main. web-prod-01 is ${webStatus}; vpn-gateway is ${vpnStatus}.`,
       `Suspected root cause: db-prod-main storage pressure${facts.dbStoragePct ? ` at ${facts.dbStoragePct}% allocation` : ""}, with risk of slow queries, failed writes, or connection pool saturation.`,
-      "Actions taken: reviewed OKF host status, identified db-prod-main as the strongest suspect, compared web and VPN status, and scoped immediate mitigation.",
+      "Actions taken: reviewed host status records, identified db-prod-main as the strongest suspect, compared web and VPN status, and scoped immediate mitigation.",
       "Immediate mitigation: pause non-critical batch jobs, free or extend database storage, check slow-query and connection-pool metrics, verify recent DB maintenance or growth spikes, and keep checkout monitoring open.",
       "Open questions: current DB latency, error rate, disk I/O, connection saturation, replication health, recent deploys, exact checkout error codes, and whether VPN telemetry is relevant for the reporting user.",
       "Escalation recommendation: page the database/on-call owner now; keep web and network owners informed but do not make them primary unless new telemetry contradicts the DB signal."
@@ -1926,8 +1952,8 @@ function buildOpsDeterministicAnswer(state, observation, followups) {
     return [
       "Confirmed status:",
       `- db-prod-main: ${dbStatus}${facts.dbStoragePct ? ` with ${facts.dbStoragePct}% storage allocation` : ""}. This is the strongest confirmed abnormal signal.`,
-      `- web-prod-01: ${webStatus}. No OKF evidence currently points to web host failure.`,
-      `- vpn-gateway: ${vpnStatus}. The VPN status is present in OKF; no VPN-specific symptom is confirmed for checkout.`,
+      `- web-prod-01: ${webStatus}. No available evidence currently points to web host failure.`,
+      `- vpn-gateway: ${vpnStatus}. The VPN status is present in the available records; no VPN-specific symptom is confirmed for checkout.`,
       "",
       "Assumptions:",
       "- Slow checkout is assumed to depend on db-prod-main because checkout commonly needs database reads/writes; this still needs telemetry confirmation.",
@@ -1955,7 +1981,7 @@ function buildOpsDeterministicAnswer(state, observation, followups) {
       "",
       `Reasoning: web-prod-01 is ${webStatus}, vpn-gateway is ${vpnStatus}, while db-prod-main is ${dbStatus}${facts.dbStoragePct ? ` with a ${facts.dbStoragePct}% storage allocation warning` : ""}. Slow checkout and intermittent errors are consistent with database pressure because checkout usually depends on database reads/writes.`,
       "",
-      "Known facts: db-prod-main is degraded; web-prod-01 and vpn-gateway do not currently show a confirmed abnormal OKF status.",
+      "Known facts: db-prod-main is degraded; web-prod-01 and vpn-gateway do not currently show a confirmed abnormal status in the available records.",
       "",
       "Next check: pull db-prod-main latency, disk I/O, storage-growth, slow-query, write-error, and connection-pool metrics for the incident window."
     ].join("\n");
@@ -2043,7 +2069,7 @@ function buildAcademicDeterministicAnswer(state, observation, followups) {
       "",
       "Follow-up research directions: compare full self-attention with sparse or linearized attention, study how positional encoding choices affect long-context reasoning, evaluate retrieval versus larger context windows, and test whether attention patterns actually explain model behavior or merely correlate with it.",
       "",
-      "Evidence used: OKF knowledge identifies self-attention, multi-head attention, positional encoding, and the Transformer architecture as the seed concepts"
+      "Evidence used: the available information identifies self-attention, multi-head attention, positional encoding, and the Transformer architecture as the seed concepts"
         + (bibliographic ? `; live lookup added bibliographic context (${bibliographic}).` : "."),
       "",
       "Missing evidence: this is not yet a complete citation graph. A stronger review should add targeted Scholar/Semantic Scholar/OpenAlex/Crossref citation expansion and full-text comparison."
@@ -2052,7 +2078,7 @@ function buildAcademicDeterministicAnswer(state, observation, followups) {
 
   if (asksCompare) {
     return [
-      "Known facts: the active OKF treats \"Attention Is All You Need\" as the seed paper for the Transformer architecture, centered on self-attention rather than recurrence or convolution. It also names scaled dot-product attention, multi-head attention, positional encodings, feed-forward layers, residual connections, and layer normalization as core components.",
+      "Known facts: the available information treats \"Attention Is All You Need\" as the seed paper for the Transformer architecture, centered on self-attention rather than recurrence or convolution. It also names scaled dot-product attention, multi-head attention, positional encodings, feed-forward layers, residual connections, and layer normalization as core components.",
       "",
       "Missing evidence: the current tool evidence is bibliographic and metadata-oriented. It does not by itself prove the paper's claims, reproduce the experiments, build a full citation graph, or verify how later work changed the original conclusions.",
       "",
@@ -2068,7 +2094,7 @@ function buildAcademicDeterministicAnswer(state, observation, followups) {
       "",
       "That matters because self-attention lets the model compare all tokens in a sequence directly, so dependencies can be modeled in parallel instead of being processed step by step as in RNN/LSTM-style systems. The paper combines scaled dot-product attention, multi-head attention, positional encodings, feed-forward layers, residual connections, and layer normalization into an encoder-decoder architecture for machine translation.",
       "",
-      "Evidence used: the active OKF identifies the paper as the Transformer seed paper, and the live literature-search tool provides bibliographic grounding from Crossref/arXiv when available"
+      "Evidence used: the available information identifies the paper as the Transformer seed paper, and the live literature-search tool provides bibliographic grounding from Crossref/arXiv when available"
         + (bibliographic ? ` (${bibliographic}).` : "."),
       "",
       "Limitations: Crossref/arXiv metadata can support bibliographic identification, but it is not a full citation-analysis system and it does not replace reading the paper itself.",
