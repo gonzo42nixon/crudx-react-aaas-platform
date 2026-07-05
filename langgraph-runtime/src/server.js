@@ -70,6 +70,7 @@ async function invokeGraph(requestBody) {
   const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
   const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
   const okfEnvelope = requestBody.okf_envelope || requestBody.okfEnvelope;
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
   const trace = [step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey })];
 
   if (!input) throw new Error("INPUT_REQUIRED");
@@ -86,6 +87,7 @@ async function invokeGraph(requestBody) {
       input,
       messages,
       dryRun,
+      metadata,
       langsmith,
       trace
     });
@@ -139,6 +141,10 @@ function createExternalLangGraph() {
     messages: Annotation({
       reducer: (_left, right) => right,
       default: () => []
+    }),
+    metadata: Annotation({
+      reducer: (_left, right) => right,
+      default: () => ({})
     }),
     agent: Annotation(),
     plan: Annotation(),
@@ -224,6 +230,8 @@ function createExternalLangGraph() {
             plan: selectedTool
               ? isPeanoAgent(state.agent)
                 ? `Start with ${selectedTool.name}, verify the Peano recursion result, then return the required JSON object.`
+                : isLocationAgent(state.agent)
+                  ? `Start with ${selectedTool.name}, classify the evidence level, then produce a privacy-aware location estimate.`
                 : `Start with ${selectedTool.name}, then run follow-up checks before producing the final agent response.`
               : "Answer from the OKF context without invoking a configured tool.",
             action: selectedTool?.name || "none"
@@ -250,7 +258,7 @@ function createExternalLangGraph() {
         { action: state.action, input: state.input },
         { graph_node: "tool_observation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
         async () => ({
-          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey, langsmith)
+          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey, langsmith, state.metadata)
         }),
         (result) => result
       );
@@ -324,7 +332,8 @@ function createExternalLangGraph() {
             "search_knowledge_base",
             state.okfKey,
             () => buildPolicyObservation(state.input, state.agent),
-            langsmith
+            langsmith,
+            state.metadata
           )
         }),
         (result) => result
@@ -354,7 +363,8 @@ function createExternalLangGraph() {
             "calculate_days",
             state.okfKey,
             () => buildCalendarObservation(state.input),
-            langsmith
+            langsmith,
+            state.metadata
           )
         }),
         (result) => result
@@ -457,7 +467,7 @@ function createExternalLangGraph() {
     .compile();
 }
 
-async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, langsmith, trace }) {
+async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, metadata, langsmith, trace }) {
   const graph = createExternalLangGraph();
   const result = await withLangSmithChild(
     langsmith,
@@ -466,7 +476,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
     { okf_key: okfKey, input, history_messages: messages.length },
     { graph: "crudx_okf_react_discourse", okf_key: okfKey, runtime_boundary: "external" },
     () => graph.invoke(
-      { okfEnvelope, okfKey, input, messages, dryRun },
+      { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {} },
       { configurable: { dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
     ),
     (state) => ({
@@ -547,6 +557,10 @@ function selectGraphTool(input, agent) {
     return tools.find((tool) => /peano|add/i.test(tool.name))
       || tools[0];
   }
+  if (/requestor|requester|aufenthaltsort|standort|location|where am i|where is the user|wo bin ich|wo ist der nutzer|wo ist der requestor/i.test(input)) {
+    return tools.find((tool) => /requestor|requester|location|geo|standort/i.test(tool.name))
+      || tools[0];
+  }
   if (/vacation|urlaub|days|tage|remaining|balance|approve|approval|period|request/.test(text)) {
     if (dates.length >= 2 || /business-day|business day|from\s+20\d{2}-\d{2}-\d{2}/i.test(input)) {
       return tools.find((tool) => /calculate|days/i.test(tool.name))
@@ -569,6 +583,14 @@ function buildContextReview(input, messages, agent) {
       "The executor should invoke the Peano addition tool for addition requests and preserve the OKF JSON output contract."
     ].join(" ");
   }
+  if (isLocationAgent(agent)) {
+    return [
+      "The current turn concerns requestor location estimation.",
+      `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of privacy/location knowledge.`,
+      "The executor should invoke the requestor location tool and clearly distinguish explicit, header-derived, and weak browser-context evidence."
+    ].join(" ");
+  }
   const text = String(input || "").toLowerCase();
   const history = Array.isArray(messages) ? messages : [];
   const topics = [];
@@ -584,7 +606,7 @@ function buildContextReview(input, messages, agent) {
   ].join(" ");
 }
 
-async function executeOkfTool(input, agent, action, okfKey, langsmith) {
+async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata = {}) {
   if (action === "none") return buildGraphObservation(input, agent, action);
 
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
@@ -599,16 +621,21 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith) {
   const fallback = buildGraphObservation(input, agent, action);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
+  const parameters = inferToolParameters(input, tool, agent);
+  if (metadata?.request_context) parameters.request_context = metadata.request_context;
   const payload = {
     tool: tool.name || action,
     query: input,
     input,
     agent_id: agent?.agent_id || null,
     okf_key: okfKey || null,
-    parameters: inferToolParameters(input, tool, agent),
+    parameters,
     knowledge: agent?.knowledge || "",
     okf: agent?.okf || null,
-    meta: agent?.meta || {}
+    meta: {
+      ...(agent?.meta || {}),
+      request_context: metadata?.request_context || null
+    }
   };
 
   const callWebhook = async () => {
@@ -673,13 +700,13 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith) {
   }
 }
 
-async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory, langsmith) {
+async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory, langsmith, metadata = {}) {
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   const tool = tools.find((candidate) => candidate.name === preferredName)
     || tools.find((candidate) => new RegExp(escapeRegex(preferredName), "i").test(candidate.name || ""));
   if (!tool) return fallbackFactory();
 
-  const observation = await executeOkfTool(input, agent, tool.name, okfKey, langsmith);
+  const observation = await executeOkfTool(input, agent, tool.name, okfKey, langsmith, metadata);
   if (observation && !/No configured tool was selected/i.test(observation)) return observation;
   return fallbackFactory();
 }
@@ -702,7 +729,16 @@ function inferToolParameters(input, tool, agent) {
   if (/server|status|node|health/.test(name)) {
     params.target = inferServerTarget(input, agent);
   }
+  if (/requestor|requester|location|geo|standort/.test(name)) {
+    const explicit = inferLocationText(input);
+    if (explicit) params.location = explicit;
+  }
   return params;
+}
+
+function inferLocationText(input) {
+  const match = /\b(?:i am in|i'm in|my location is|mein standort ist|ich bin in|aufenthaltsort ist)\s+([A-Za-zÄÖÜäöüß '-]{2,80}?)(?:[.?!,;\n]|$)/i.exec(String(input || ""));
+  return match ? match[1].trim().replace(/[.?!,;:]+$/, "") : "";
 }
 
 function inferNaturalOperands(input) {
@@ -767,6 +803,13 @@ function buildAgentReflection(state) {
       `Current action was ${state.action || "none"}.`
     ].join(" ");
   }
+  if (isLocationAgent(state.agent)) {
+    return [
+      "The location observation must be treated as an estimate, not a certainty.",
+      "Only explicit coordinates or explicit user-supplied place text should be described as high confidence.",
+      `Current action was ${state.action || "none"}.`
+    ].join(" ");
+  }
   const hasDates = extractIsoDates(state.input || "").length >= 2;
   const hasKnowledge = Boolean(String(state.agent?.knowledge || "").trim());
   return [
@@ -781,6 +824,9 @@ function buildInternalFollowupQuestion(state) {
   if (isPeanoAgent(state.agent)) {
     return "Which Peano recursion rule and base case validate the structural result?";
   }
+  if (isLocationAgent(state.agent)) {
+    return "Which evidence level supports this location estimate, and what consent or context is missing for higher precision?";
+  }
   if (/2026-\d{2}-\d{2}/.test(String(state.input || ""))) {
     return "Which HR rules and date-calculation facts must be checked before this vacation request can be recommended for approval?";
   }
@@ -790,6 +836,9 @@ function buildInternalFollowupQuestion(state) {
 function buildPolicyObservation(input, agent) {
   if (isPeanoAgent(agent)) {
     return "Peano rule check: addition is defined by A(x, 0) = x and A(x, S(y)) = S(A(x, y)).";
+  }
+  if (isLocationAgent(agent)) {
+    return "Privacy rule check: precise GPS location requires explicit coordinates or consented browser geolocation; time zone and locale are weak hints only.";
   }
   const knowledge = String(agent?.knowledge || "");
   const snippets = selectKnowledgeSnippets(input, knowledge, [/policy|rule|request|approval|approve|vacation|urlaub|entitled|advance|weeks|days/i]);
@@ -802,6 +851,9 @@ function buildPolicyObservation(input, agent) {
 function buildCalendarObservation(input) {
   if (/peano|successor|A\(|S\(/i.test(String(input || ""))) {
     return "Non-temporal check: no calendar calculation is required for Peano arithmetic.";
+  }
+  if (/requestor|requester|aufenthaltsort|standort|location|where am i|wo bin ich/i.test(String(input || ""))) {
+    return "Non-temporal check: no calendar calculation is required for requestor location estimation.";
   }
   const dates = extractIsoDates(input);
   if (dates.length >= 2) {
@@ -821,6 +873,15 @@ function buildAgentSynthesis(state) {
       `1. Peano tool observation: ${state.observation || "none"}`,
       `2. Rule observation: ${state.policyObservation || "none"}`,
       "Recommendation logic: preserve the deterministic Peano result and return only the required JSON object."
+    ].join("\n");
+  }
+  if (isLocationAgent(state.agent)) {
+    return [
+      "Synthesis:",
+      `1. Location observation: ${state.observation || "none"}`,
+      `2. Privacy observation: ${state.policyObservation || "none"}`,
+      `3. Temporal observation: ${state.calendarObservation || "none"}`,
+      "Recommendation logic: answer transparently with confidence, evidence, and any missing consent/context needed for greater precision."
     ].join("\n");
   }
   return [
@@ -909,6 +970,17 @@ function isPeanoAgent(agent) {
     (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
   ].join("\n");
   return /peano|math-peano-core|peano_addition/i.test(haystack);
+}
+
+function isLocationAgent(agent) {
+  const haystack = [
+    agent?.agent_id,
+    agent?.meta?.id,
+    agent?.meta?.name,
+    agent?.okf?.system_prompt,
+    (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
+  ].join("\n");
+  return /requestor.location|requester.location|requestor-location|requestor_location|standort|geo/i.test(haystack);
 }
 
 function extractJsonObjectFromText(text) {
@@ -1002,6 +1074,14 @@ function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
   const policy = String(state.policyObservation || "");
   const calendar = String(state.calendarObservation || "");
+  if (isLocationAgent(state.agent)) {
+    const snippets = uniqueSentences([observation, policy, calendar])
+      .filter((part) => part && !/^No observation available/i.test(part));
+    if (!snippets.length) {
+      return "I could not determine the requestor location reliably from the available context. Please provide an explicit place or consented browser geolocation if a more precise estimate is required.";
+    }
+    return `${snippets.join(" ")} For greater precision, pass explicit coordinates or ask the requestor to share browser geolocation with consent.`;
+  }
   const snippets = uniqueSentences([observation, policy, calendar])
     .filter((part) => part && !/^No observation available/i.test(part) && !/^Policy check: no/i.test(part) && !/^Calendar check: no/i.test(part));
   if (!snippets.length) {

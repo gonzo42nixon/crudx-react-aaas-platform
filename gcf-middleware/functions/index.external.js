@@ -85,9 +85,11 @@ exports.reactAaasInvoke = onRequest(
         dry_run: dryRun,
         okf_envelope: okfEnvelope,
         metadata: {
+          ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
           source: "gcf-react-aaas-middleware",
           runtime_boundary: "external-langgraph",
-          received_at: startedAt
+          received_at: startedAt,
+          request_context: buildRequestContext(req, requestBody.metadata?.request_context)
         }
       });
       trace.push(step("langgraph", "external_runtime_completed", {
@@ -299,6 +301,52 @@ exports.peanoAddition = onRequest(
   }
 );
 
+exports.requestorLocation = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 30,
+    memory: "256MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const context = buildRequestContext(req, body.parameters?.request_context || body.meta?.request_context);
+      const explicitLocation = inferExplicitLocation(body);
+      const location = explicitLocation || inferLocationFromContext(context);
+      const confidence = explicitLocation ? "high" : location ? location.confidence : "none";
+      const evidence = [
+        explicitLocation ? "explicit user-supplied location" : null,
+        context.time_zone ? `browser time zone: ${context.time_zone}` : null,
+        context.language ? `browser language: ${context.language}` : null,
+        context.country ? `request country header: ${context.country}` : null,
+        context.region ? `request region header: ${context.region}` : null,
+        context.city ? `request city header: ${context.city}` : null,
+        context.ip ? "forwarded request IP present" : null
+      ].filter(Boolean);
+
+      const answer = location
+        ? `Requestor location estimate: ${location.label}. Confidence: ${confidence}. Evidence: ${evidence.join("; ")}.`
+        : `Requestor location could not be determined reliably. Evidence available: ${evidence.join("; ") || "none"}. Ask the requestor to share location explicitly or pass browser geolocation with consent.`;
+
+      res.status(200).json({
+        ok: true,
+        tool: "requestor_location",
+        location: location || null,
+        confidence,
+        evidence,
+        request_context: redactRequestContext(context),
+        observation: answer
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
 exports.checkServerStatus = onRequest(
   {
     region: REGION,
@@ -431,6 +479,104 @@ function normalizeToolRequest(rawBody) {
     knowledge: String(body.knowledge || ""),
     okf: typeof body.okf === "object" && body.okf ? body.okf : null,
     meta: typeof body.meta === "object" && body.meta ? body.meta : {}
+  };
+}
+
+function buildRequestContext(req, clientContext) {
+  const forwardedFor = String(req.headers["x-forwarded-for"] || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const source = typeof clientContext === "object" && clientContext ? clientContext : {};
+  return {
+    ip: String(source.ip || forwardedFor[0] || req.headers["x-appengine-user-ip"] || "").trim(),
+    country: String(source.country || req.headers["x-appengine-country"] || req.headers["x-vercel-ip-country"] || req.headers["cf-ipcountry"] || "").trim(),
+    region: String(source.region || req.headers["x-appengine-region"] || req.headers["x-vercel-ip-country-region"] || "").trim(),
+    city: String(source.city || req.headers["x-appengine-city"] || req.headers["x-vercel-ip-city"] || "").trim(),
+    latitude: source.latitude ?? source.lat ?? "",
+    longitude: source.longitude ?? source.lon ?? source.lng ?? "",
+    accuracy_m: source.accuracy_m ?? source.accuracy ?? "",
+    time_zone: String(source.time_zone || source.timeZone || "").trim(),
+    language: String(source.language || "").trim(),
+    languages: Array.isArray(source.languages) ? source.languages.slice(0, 6).map(String) : [],
+    user_agent: String(source.user_agent || source.userAgent || req.headers["user-agent"] || "").slice(0, 300),
+    url: String(source.url || "").slice(0, 500)
+  };
+}
+
+function inferExplicitLocation(body) {
+  const parameters = body.parameters || {};
+  const text = [
+    parameters.location,
+    parameters.place,
+    parameters.address,
+    body.query
+  ].map((value) => String(value || "")).join("\n");
+  const coords = inferCoordinates(parameters);
+  if (coords) {
+    return {
+      label: `${coords.latitude}, ${coords.longitude}`,
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+      accuracy_m: parameters.accuracy_m || parameters.accuracy || null,
+      source: "explicit_coordinates",
+      confidence: "high"
+    };
+  }
+  const match = /\b(?:i am in|i'm in|my location is|mein standort ist|ich bin in|aufenthaltsort ist)\s+([A-Za-zÄÖÜäöüß '-]{2,80}?)(?:[.?!,;\n]|$)/i.exec(text);
+  if (!match) return null;
+  return {
+    label: match[1].trim().replace(/[.?!,;:]+$/, ""),
+    source: "explicit_text",
+    confidence: "high"
+  };
+}
+
+function inferCoordinates(parameters) {
+  const latitude = Number(parameters.latitude ?? parameters.lat);
+  const longitude = Number(parameters.longitude ?? parameters.lon ?? parameters.lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { latitude, longitude };
+}
+
+function inferLocationFromContext(context) {
+  const hasLatitude = context.latitude !== "" && context.latitude !== null && context.latitude !== undefined;
+  const hasLongitude = context.longitude !== "" && context.longitude !== null && context.longitude !== undefined;
+  const lat = hasLatitude ? Number(context.latitude) : NaN;
+  const lon = hasLongitude ? Number(context.longitude) : NaN;
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    return {
+      label: `${lat}, ${lon}`,
+      latitude: lat,
+      longitude: lon,
+      accuracy_m: context.accuracy_m || null,
+      source: "browser_geolocation",
+      confidence: "high"
+    };
+  }
+  if (context.city || context.region || context.country) {
+    return {
+      label: [context.city, context.region, context.country].filter(Boolean).join(", "),
+      country: context.country || null,
+      region: context.region || null,
+      city: context.city || null,
+      source: "request_headers",
+      confidence: context.city ? "medium" : "low"
+    };
+  }
+  if (context.time_zone) {
+    return {
+      label: `time zone ${context.time_zone}`,
+      time_zone: context.time_zone,
+      source: "browser_time_zone",
+      confidence: "low"
+    };
+  }
+  return null;
+}
+
+function redactRequestContext(context) {
+  return {
+    ...context,
+    ip: context.ip ? "[redacted]" : ""
   };
 }
 
