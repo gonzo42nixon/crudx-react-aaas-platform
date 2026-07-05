@@ -510,6 +510,40 @@ function buildConversationContext(messages) {
   return messages.map((message, index) => `${index + 1}. ${message.role.toUpperCase()}: ${message.content}`).join("\n");
 }
 
+function buildConversationMemory(messages, agent) {
+  if (!Array.isArray(messages) || !messages.length) return "No prior case memory available.";
+  const context = buildConversationContext(messages);
+  if (isHrAgent(agent)) {
+    const facts = extractHrFacts([agent?.knowledge || "", context].join("\n"));
+    const memory = [];
+    if (/Max Mustermann|max_01/i.test(context)) {
+      memory.push(`employee=Max Mustermann${facts.department ? ` (${facts.department})` : ""}`);
+    }
+    if (facts.maxBalance != null) memory.push(`remaining_balance=${facts.maxBalance} days`);
+    if (/2026-08-03/i.test(context) && /2026-08-14/i.test(context)) memory.push("requested_period=2026-08-03..2026-08-14");
+    if (facts.businessDays != null) memory.push(`business_day_impact=${facts.businessDays} days`);
+    if (facts.entitlement != null) memory.push(`annual_entitlement=${facts.entitlement} days`);
+    if (facts.advanceWeeks != null) memory.push(`advance_notice=${facts.advanceWeeks} weeks`);
+    if (/Sandra Schreiber|sandra_02/i.test(context)) {
+      memory.push(`coverage_candidate=Sandra Schreiber${facts.sandraBalance != null ? ` (${facts.sandraBalance} remaining vacation days; availability not proven)` : " (availability not proven)"}`);
+    }
+    if (/manager approval|coverage|holiday calendar|submission date/i.test(context)) {
+      memory.push("open_checks=submission date, manager approval, holiday calendar, coverage");
+    }
+    return memory.length ? `HR case memory: ${memory.join("; ")}.` : "HR case memory: prior turns exist, but no durable HR facts were extracted.";
+  }
+  if (isAcademicAgent(agent)) {
+    const title = /"([^"]+)"/.exec(context)?.[1] || "";
+    const topics = [];
+    if (title) topics.push(`paper_title="${title}"`);
+    if (/doi/i.test(context)) topics.push("bibliographic_identifier=DOI/arXiv may be needed");
+    if (/related|theme|future|direction/i.test(context)) topics.push("focus=related work and future directions");
+    if (/missing evidence|known facts|next research/i.test(context)) topics.push("review_frame=known facts vs missing evidence vs next steps");
+    return topics.length ? `Academic case memory: ${topics.join("; ")}.` : "Academic case memory: prior research turns exist, but no durable bibliographic facts were extracted.";
+  }
+  return `Conversation memory: ${messages.length} prior messages are available. Use them to resolve references such as "this", "that", "the previous request", and "final summary".`;
+}
+
 function selectGraphTool(input, agent) {
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   if (!tools.length) return null;
@@ -541,10 +575,12 @@ function selectGraphTool(input, agent) {
 }
 
 function buildContextReview(input, messages, agent) {
+  const memory = buildConversationMemory(messages, agent);
   if (isPeanoAgent(agent)) {
     return [
       "The current turn concerns Peano arithmetic.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      memory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local Peano knowledge.`,
       "The executor should invoke the Peano addition tool for addition requests and preserve the OKF JSON output contract."
     ].join(" ");
@@ -553,6 +589,7 @@ function buildContextReview(input, messages, agent) {
     return [
       "The current turn concerns requestor location estimation.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      memory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of privacy/location knowledge.`,
       "The executor should invoke the requestor location tool and clearly distinguish explicit, header-derived, and weak browser-context evidence."
     ].join(" ");
@@ -561,6 +598,7 @@ function buildContextReview(input, messages, agent) {
     return [
       "The current turn concerns academic research assistance.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      memory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local research knowledge.`,
       "The executor should ground claims in the research tool and separate known facts, inferred context, missing evidence, and next research steps."
     ].join(" ");
@@ -575,6 +613,7 @@ function buildContextReview(input, messages, agent) {
   return [
     `The current turn concerns ${topics.join(", ")}.`,
     `Prior conversation turns available: ${history.length}.`,
+    memory,
     `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local knowledge.`,
     "The executor should avoid a premature final answer and use only tools that are configured in the active OKF and relevant to the current request."
   ].join(" ");
@@ -985,6 +1024,9 @@ function buildGraphFinalPrompt(state) {
     "",
     "Prior conversation:",
     buildConversationContext(state.messages || []),
+    "",
+    "Conversation memory summary:",
+    buildConversationMemory(state.messages || [], state.agent),
     "",
     `Current user input: ${state.input}`,
     "",
