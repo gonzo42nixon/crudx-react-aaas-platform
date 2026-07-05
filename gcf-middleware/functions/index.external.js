@@ -14,6 +14,8 @@ const LANGGRAPH_RUNTIME_MODE = defineString("LANGGRAPH_RUNTIME_MODE", { default:
 const LANGGRAPH_ASSISTANT_ID = defineString("LANGGRAPH_ASSISTANT_ID", { default: "agent" });
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
+const CRUDX_TIMELINE_TAG = "Created>2026>07>03";
+const CRUDX_OWNER = "drueffler@gmail.com";
 
 exports.reactAaasInvoke = onRequest(
   {
@@ -557,7 +559,24 @@ async function writeCrudxEnvelope(key, envelope) {
     mime_type: "JSON",
     content_type: "application/json",
     value: JSON.stringify({ ...envelope, key }, null, 2),
-    user_tags: ["R+", "data", "json", "aaas", "react-aaas-run", `agent:${envelope.agent_id || "unknown"}`]
+    owner: CRUDX_OWNER,
+    access_control: [CRUDX_OWNER],
+    user_tags: [
+      "R+",
+      "data",
+      "json",
+      "aaas",
+      "react-aaas-run",
+      "agent-run",
+      "run",
+      "trace",
+      "crudx-gcf",
+      CRUDX_TIMELINE_TAG,
+      `agent:${envelope.agent_id || "unknown"}`,
+      envelope.okf_key ? `okf:${envelope.okf_key}` : null,
+      envelope.langsmith?.trace_id ? "langsmith" : null,
+      envelope.langsmith?.trace_id ? "langsmith-trace" : null
+    ].filter(Boolean)
   };
 
   const response = await fetch(`${CRUDX_DOCS_API.value()}/docs/${encodeURIComponent(key)}`, {
