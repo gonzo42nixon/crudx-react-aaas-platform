@@ -611,9 +611,10 @@ async function translateWithGemini(text, target) {
   const prompt = [
     `Translate the following assistant answer into ${language}.`,
     "Preserve meaning, URLs, numbers, names, CRUDX IDs, and formatting.",
+    "Translate the complete text. Do not summarize, shorten, omit sections, or replace content with ellipses.",
     "Do not add commentary, notes, explanations, Markdown fences, or source labels.",
     "",
-    text.slice(0, 8000)
+    text.slice(0, 20000)
   ].join("\n");
   const response = await fetch(endpoint, {
     method: "POST",
@@ -623,7 +624,7 @@ async function translateWithGemini(text, target) {
     },
     body: JSON.stringify({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.1, maxOutputTokens: 1200 }
+      generationConfig: { temperature: 0.1, maxOutputTokens: 8192 }
     })
   });
   const payload = await response.json().catch(() => ({}));
@@ -987,7 +988,7 @@ function buildRouteResponse(routeRequest, location, evidence) {
         ? `Roundtrip route: requestor -> ${targetLabels} -> requestor.`
         : `Route: requestor -> ${targetLabels}.`,
       `Requestor origin: ${location.label || originLabel}.`,
-      `Google Maps route: ${url}`,
+      `Google Maps route (flight-oriented; no driving mode forced): ${url}`,
       notes.length ? `Notes: ${notes.join(" ")}` : ""
     ].filter(Boolean).join(" ")
   };
@@ -1009,7 +1010,6 @@ function googleMapsDirectionsUrl({ origin, destination, waypoints = [] }) {
   if (waypoints.length) {
     url.searchParams.set("waypoints", waypoints.map((point) => `${point.latitude},${point.longitude}`).join("|"));
   }
-  url.searchParams.set("travelmode", "driving");
   return url.toString();
 }
 

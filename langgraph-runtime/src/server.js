@@ -214,6 +214,7 @@ function createExternalLangGraph() {
       trace?.push(step("langgraph", "node_context_review", {
         history_messages: state.messages.length,
         review_chars: result.contextReview.length,
+        review: result.contextReview,
         review_preview: previewText(result.contextReview)
       }));
       return {
@@ -274,6 +275,7 @@ function createExternalLangGraph() {
       trace?.push(step("langgraph", "node_tool_observation", {
         action: state.action,
         observation_chars: result.observation.length,
+        observation: result.observation,
         observation_preview: previewText(result.observation)
       }));
       return {
@@ -299,6 +301,7 @@ function createExternalLangGraph() {
       );
       trace?.push(step("langgraph", "node_agent_reflection", {
         reflection_chars: result.reflection.length,
+        reflection: result.reflection,
         reflection_preview: previewText(result.reflection)
       }));
       return {
@@ -319,6 +322,7 @@ function createExternalLangGraph() {
       );
       trace?.push(step("langgraph", "node_agent_followup_question", {
         question_chars: result.followupQuestion.length,
+        question: result.followupQuestion,
         question_preview: previewText(result.followupQuestion)
       }));
       return {
@@ -341,6 +345,7 @@ function createExternalLangGraph() {
       trace?.push(step("langgraph", "node_tool_followups", {
         actions: observations.map((item) => item.tool),
         observation_count: observations.length,
+        observation: observations.map((item) => `${item.tool}: ${item.observation}`).join(" "),
         observation_preview: previewText(observations.map((item) => `${item.tool}: ${item.observation}`).join(" "))
       }));
       return {
@@ -364,6 +369,7 @@ function createExternalLangGraph() {
       );
       trace?.push(step("langgraph", "node_agent_synthesis", {
         synthesis_chars: result.synthesis.length,
+        synthesis: result.synthesis,
         synthesis_preview: previewText(result.synthesis)
       }));
       return {
@@ -413,6 +419,7 @@ function createExternalLangGraph() {
       trace?.push(step("langgraph", "node_agent_draft", {
         model: GEMINI_MODEL,
         text_chars: draftAnswer.length,
+        answer: draftAnswer,
         answer_preview: previewText(draftAnswer)
       }));
       return {
@@ -449,6 +456,7 @@ function createExternalLangGraph() {
         configured: feedback.configured,
         review_count: feedback.reviews.length,
         providers: feedback.reviews.map((review) => review.provider),
+        feedback: formatCriticFeedback(feedback),
         feedback_preview: previewText(formatCriticFeedback(feedback), 640),
         errors: feedback.errors.slice(0, 3)
       }));
@@ -509,6 +517,7 @@ function createExternalLangGraph() {
         model: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
         revised_with_critic_feedback: Boolean(result.revised),
         text_chars: finalAnswer.length,
+        answer: finalAnswer,
         answer_preview: previewText(finalAnswer)
       }));
       return {
