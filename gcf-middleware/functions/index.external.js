@@ -14,7 +14,7 @@ const LANGGRAPH_RUNTIME_MODE = defineString("LANGGRAPH_RUNTIME_MODE", { default:
 const LANGGRAPH_ASSISTANT_ID = defineString("LANGGRAPH_ASSISTANT_ID", { default: "agent" });
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
-const CRUDX_TIMELINE_TAG = "Created>2026>07>03";
+const CRUDX_TIMELINE_TAG = "Created>2026>07>05";
 const CRUDX_OWNER = "drueffler@gmail.com";
 
 exports.reactAaasInvoke = onRequest(
