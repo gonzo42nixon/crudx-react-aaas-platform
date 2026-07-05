@@ -682,7 +682,10 @@ function selectGraphTool(input, agent) {
   if (!tools.length) return null;
   const text = String(input || "").toLowerCase();
   const dates = extractIsoDates(input);
-  if (/peano|successor|add|addition|\bplus\b|\+|A\(/i.test(input)) {
+  if (isPeanoAgent(agent) && /axiom|axioms|list|auflisten|liste/i.test(input) && !/\badd\b|addition|\bplus\b|\+|A\(/i.test(input)) {
+    return null;
+  }
+  if (/successor|add|addition|\bplus\b|\+|A\(/i.test(input)) {
     return tools.find((tool) => /peano|add/i.test(tool.name))
       || tools[0];
   }
@@ -919,7 +922,8 @@ function shouldRunToolForInput(tool, input, agent) {
     return /requestor|requester|aufenthaltsort|standort|location|where am i|wo bin ich/i.test(input);
   }
   if (/peano|addition|successor/.test(haystack)) {
-    return /peano|successor|add|addition|\bplus\b|\+|A\(/i.test(input);
+    const operands = inferNaturalOperands(input);
+    return Boolean(operands) || /successor|add|addition|\bplus\b|\+|A\(/i.test(input);
   }
   return false;
 }
@@ -990,6 +994,9 @@ function isHttpUrl(value) {
 function buildGraphObservation(input, agent, action) {
   const knowledge = String(agent?.knowledge || "");
   const text = String(input || "").toLowerCase();
+  if (isPeanoAgent(agent) && /axiom|axioms|list|auflisten|liste/i.test(input)) {
+    return "Peano axiom request: answer from the Peano knowledge in the agent record and return the required JSON object with null result fields and an explain field.";
+  }
   if (action === "none") return "No configured tool was selected; answer from the available information and prior conversation.";
   const dates = extractIsoDates(input);
   if (/calculate|days/i.test(action) || dates.length >= 2 || /business-day|business day/.test(text)) {
@@ -1254,7 +1261,7 @@ function buildGraphRevisionPrompt(state) {
     "Default brevity rule: keep the final answer under 120 words and usually 2-4 sentences unless the user explicitly asked for a detailed/audit/handoff/comparison report.",
     "Prefer a shorter supported critic answer over a longer draft when both are correct.",
     requiresJson
-      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence, no prose, and no extra fields unless the existing OKF schema explicitly allows them."
+      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence, no prose, and no extra fields unless the existing OKF schema explicitly allows them. For Peano agents, the allowed fields are peano_result, integer_value, and explain."
       : "Return only the final user-facing answer. Do not output JSON, Markdown code fences, trace data, or hidden chain-of-thought.",
     "Do not mention that competing AIs reviewed the answer unless the user explicitly asks about the feedback loop.",
     "",
@@ -1529,11 +1536,11 @@ function normalizeGraphFinalAnswer(text, state) {
   const raw = String(text || "").trim();
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
   if (agentRequiresJsonOutput(state.agent)) {
-    if (looksLikeJson(withoutFences)) return withoutFences;
+    if (looksLikeJson(withoutFences)) return normalizeContractJson(withoutFences, state);
     const fromRaw = extractJsonObjectFromText(withoutFences);
-    if (fromRaw) return fromRaw;
+    if (fromRaw) return normalizeContractJson(fromRaw, state);
     const fromState = extractJsonObjectFromText([state.observation, formatFollowupObservations(state.followupObservations), state.synthesis].join("\n"));
-    if (fromState) return fromState;
+    if (fromState) return normalizeContractJson(fromState, state);
   }
   if (looksLikeJson(withoutFences)) return buildDeterministicGraphSections(state);
   const looksIncomplete = !raw
@@ -1571,6 +1578,70 @@ function humanizeUserFacingPlatformLanguage(value) {
     .replace(/\baccording to the information available\./gi, "according to the information available.")
     .replace(/\s+\n/g, "\n")
     .trim();
+}
+
+function normalizeContractJson(jsonText, state) {
+  if (!isPeanoAgent(state.agent)) return String(jsonText || "").trim();
+  try {
+    const parsed = JSON.parse(jsonText);
+    const asksAxiomsOnly = /axiom|axioms|list|auflisten|liste/i.test(String(state.input || ""))
+      && !/\badd\b|addition|\bplus\b|\+|A\(/i.test(String(state.input || ""));
+    if (asksAxiomsOnly) {
+      return JSON.stringify({
+        peano_result: null,
+        integer_value: null,
+        explain: buildPeanoExplain(state, parsed)
+      });
+    }
+    const evidence = extractPeanoEvidenceObject(state);
+    const peanoResult = parsed.peano_result ?? evidence?.peano_result ?? null;
+    const rawIntegerValue = parsed.integer_value ?? evidence?.integer_value;
+    const integerValue = Number.isFinite(Number(rawIntegerValue)) ? Number(rawIntegerValue) : null;
+    const parsedExplain = typeof parsed.explain === "string" ? parsed.explain.trim() : "";
+    const explain = parsedExplain && !/not available|missing|could not/i.test(parsedExplain)
+      ? parsedExplain
+      : buildPeanoExplain(state, { ...parsed, peano_result: peanoResult, integer_value: integerValue });
+    const normalized = {
+      peano_result: peanoResult,
+      integer_value: integerValue,
+      explain
+    };
+    return JSON.stringify(normalized);
+  } catch {
+    return String(jsonText || "").trim();
+  }
+}
+
+function buildPeanoExplain(state, parsed = {}) {
+  const input = String(state.input || "");
+  const asksAxioms = /axiom|axioms|list|auflisten|liste/i.test(input);
+  const axiomText = "Peano axioms: 0 is a natural number; every natural number n has a successor S(n); 0 is not the successor of any natural number; S is injective, so S(a)=S(b) implies a=b; induction says any set containing 0 and closed under successor contains all natural numbers.";
+  if (asksAxioms && !/\badd\b|addition|\bplus\b|\+|A\(/i.test(input)) return axiomText;
+  const operands = inferNaturalOperands(input);
+  const recursion = operands
+    ? `Addition is evaluated by A(x,0)=x and A(x,S(y))=S(A(x,y)); for ${operands.left} and ${operands.right}, the successor recursion reaches the base case and yields ${parsed.peano_result || "the shown Peano result"}.`
+    : `Addition is evaluated by A(x,0)=x and A(x,S(y))=S(A(x,y)); the successor recursion reaches the base case and yields ${parsed.peano_result || "the shown Peano result"}.`;
+  return `${recursion} ${axiomText}`;
+}
+
+function extractPeanoEvidenceObject(state) {
+  const followupSources = Array.isArray(state.followupObservations)
+    ? state.followupObservations.map((item) => item?.observation)
+    : [];
+  const sources = [state.observation, ...followupSources, state.synthesis, state.draftAnswer].filter(Boolean);
+  for (const source of sources) {
+    const json = extractJsonObjectFromText(source);
+    if (!json) continue;
+    try {
+      const parsed = JSON.parse(json);
+      if (typeof parsed.peano_result === "string" && Number.isFinite(Number(parsed.integer_value))) {
+        return parsed;
+      }
+    } catch {
+      // Try the next evidence source.
+    }
+  }
+  return null;
 }
 
 function agentRequiresJsonOutput(agent) {
@@ -1704,16 +1775,41 @@ function buildAcademicResearchObservation(input, agent) {
 
 function extractJsonObjectFromText(text) {
   const value = String(text || "");
-  const start = value.indexOf("{");
-  const end = value.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  const candidate = value.slice(start, end + 1);
-  try {
-    JSON.parse(candidate);
-    return candidate;
-  } catch {
-    return null;
+  for (let start = value.indexOf("{"); start >= 0; start = value.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < value.length; index += 1) {
+      const char = value[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\" && inString) {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (char === "{") depth += 1;
+      if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          const candidate = value.slice(start, index + 1);
+          try {
+            JSON.parse(candidate);
+            return candidate;
+          } catch {
+            break;
+          }
+        }
+      }
+    }
   }
+  return null;
 }
 
 function looksLikeJson(text) {
@@ -1793,8 +1889,14 @@ function buildDeterministicGraphSections(state) {
   const observation = String(state.observation || "No observation available.");
   const followups = formatFollowupObservations(state.followupObservations);
   if (isPeanoAgent(state.agent)) {
+    const evidence = extractPeanoEvidenceObject(state);
+    if (evidence) return normalizeContractJson(JSON.stringify(evidence), state);
     const json = extractJsonObjectFromText([observation, followups, state.synthesis || ""].join("\n"));
-    return json || "{\"error\":\"Peano addition result was not available\"}";
+    if (json) return normalizeContractJson(json, state);
+    if (/axiom|axioms|list|auflisten|liste/i.test(String(state.input || ""))) {
+      return JSON.stringify({ peano_result: null, integer_value: null, explain: buildPeanoExplain(state) });
+    }
+    return JSON.stringify({ peano_result: null, integer_value: null, explain: "Peano addition result was not available from the configured tool observation." });
   }
   if (isLocationAgent(state.agent)) {
     const snippets = uniqueSentences([observation, followups])
