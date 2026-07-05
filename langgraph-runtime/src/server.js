@@ -268,7 +268,10 @@ function createExternalLangGraph() {
         { action: state.action, input: state.input },
         { graph_node: "tool_observation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
         async () => ({
-          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey, langsmith, state.metadata)
+          observation: await executeOkfTool(state.input, state.agent, state.action, state.okfKey, langsmith, {
+            ...state.metadata,
+            messages: state.messages || []
+          })
         }),
         (result) => result
       );
@@ -783,7 +786,7 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata 
   const fallback = buildGraphObservation(input, agent, action);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
-  const parameters = inferToolParameters(input, tool, agent);
+  const parameters = inferToolParameters(input, tool, agent, metadata?.messages || []);
   if (metadata?.request_context) parameters.request_context = metadata.request_context;
   const payload = {
     tool: tool.name || action,
@@ -923,17 +926,17 @@ function shouldRunToolForInput(tool, input, agent) {
   }
   if (/peano|addition|successor/.test(haystack)) {
     const operands = inferNaturalOperands(input);
-    return Boolean(operands) || /successor|add|addition|\bplus\b|\+|A\(/i.test(input);
+    return Boolean(operands) || /previous result|prior result|last result|successor|add|addition|\bplus\b|\+|A\(/i.test(input);
   }
   return false;
 }
 
-function inferToolParameters(input, tool, agent) {
+function inferToolParameters(input, tool, agent, messages = []) {
   const name = String(tool?.name || "").toLowerCase();
   const dates = extractIsoDates(input);
   const params = { query: String(input || "") };
   if (/peano|add/.test(name)) {
-    const operands = inferNaturalOperands(input);
+    const operands = inferNaturalOperands(input, messages);
     if (operands) {
       params.left = operands.left;
       params.right = operands.right;
@@ -958,12 +961,47 @@ function inferLocationText(input) {
   return match ? match[1].trim().replace(/[.?!,;:]+$/, "") : "";
 }
 
-function inferNaturalOperands(input) {
+function inferNaturalOperands(input, messages = []) {
   const text = String(input || "");
   const match = /\badd\s+(\d+)\s+(?:and|to)\s+(\d+)\b/i.exec(text)
     || /\b(\d+)\s*(?:\+|plus)\s*(\d+)\b/i.exec(text)
     || /\bA\(\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(text);
-  return match ? { left: Number(match[1]), right: Number(match[2]) } : null;
+  if (match) return { left: Number(match[1]), right: Number(match[2]) };
+  const previous = inferPreviousPeanoResult(messages);
+  if (!previous) return null;
+  const increment = /\badd\s+(\d+)\s+more\b/i.exec(text)
+    || /\bprevious result\b.*?\badd\s+(\d+)\b/i.exec(text)
+    || /\bprior result\b.*?\badd\s+(\d+)\b/i.exec(text)
+    || /\blast result\b.*?\badd\s+(\d+)\b/i.exec(text)
+    || /\bsuccessor\s+of\s+(?:the\s+)?(?:previous|prior|last)\s+result\b/i.exec(text);
+  if (!increment) return null;
+  return {
+    left: Number(previous.integer_value),
+    right: increment[1] ? Number(increment[1]) : 1,
+    previous_peano_result: previous.peano_result
+  };
+}
+
+function inferPreviousPeanoResult(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || message.role !== "assistant") continue;
+    const json = extractJsonObjectFromText(message.content);
+    if (!json) continue;
+    try {
+      const parsed = JSON.parse(json);
+      if (typeof parsed.peano_result === "string" && Number.isFinite(Number(parsed.integer_value))) {
+        return {
+          peano_result: parsed.peano_result,
+          integer_value: Number(parsed.integer_value)
+        };
+      }
+    } catch {
+      // Continue scanning older assistant messages.
+    }
+  }
+  return null;
 }
 
 function inferServerTarget(input, agent) {
@@ -1617,7 +1655,7 @@ function buildPeanoExplain(state, parsed = {}) {
   const asksAxioms = /axiom|axioms|list|auflisten|liste/i.test(input);
   const axiomText = "Peano axioms: 0 is a natural number; every natural number n has a successor S(n); 0 is not the successor of any natural number; S is injective, so S(a)=S(b) implies a=b; induction says any set containing 0 and closed under successor contains all natural numbers.";
   if (asksAxioms && !/\badd\b|addition|\bplus\b|\+|A\(/i.test(input)) return axiomText;
-  const operands = inferNaturalOperands(input);
+  const operands = inferNaturalOperands(input, state.messages || []);
   const recursion = operands
     ? `Addition is evaluated by A(x,0)=x and A(x,S(y))=S(A(x,y)); for ${operands.left} and ${operands.right}, the successor recursion reaches the base case and yields ${parsed.peano_result || "the shown Peano result"}.`
     : `Addition is evaluated by A(x,0)=x and A(x,S(y))=S(A(x,y)); the successor recursion reaches the base case and yields ${parsed.peano_result || "the shown Peano result"}.`;
