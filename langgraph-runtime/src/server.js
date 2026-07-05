@@ -13,6 +13,9 @@ const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || "https://api.smith.
 const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "react-aaas-crudx";
 const LANGSMITH_WORKSPACE_ID = process.env.LANGSMITH_WORKSPACE_ID || "";
 const RUNTIME_TOKEN = process.env.LANGGRAPH_RUNTIME_TOKEN || "";
+const AI_FEEDBACK_ENABLED = process.env.AI_FEEDBACK_ENABLED !== "false";
+const AI_FEEDBACK_TIMEOUT_MS = Number(process.env.AI_FEEDBACK_TIMEOUT_MS || 12000);
+const AI_FEEDBACK_MAX_CRITICS = Number(process.env.AI_FEEDBACK_MAX_CRITICS || 3);
 
 const server = http.createServer(async (req, res) => {
   setCors(res);
@@ -160,6 +163,8 @@ function createExternalLangGraph() {
     policyObservation: Annotation(),
     calendarObservation: Annotation(),
     synthesis: Annotation(),
+    draftAnswer: Annotation(),
+    criticFeedback: Annotation(),
     finalAnswer: Annotation(),
     llmRaw: Annotation(),
     graphEvents: Annotation({
@@ -366,7 +371,7 @@ function createExternalLangGraph() {
         graphEvents: [{ node: "agent_synthesis", text_chars: result.synthesis.length }]
       };
     })
-    .addNode("agent_final", async (state, config) => {
+    .addNode("agent_draft", async (state, config) => {
       const configurable = config.configurable || {};
       const dryRun = configurable.dryRun === true || state.dryRun === true;
       const geminiKey = configurable.geminiKey || process.env.GEMINI_API_KEY || "";
@@ -374,7 +379,7 @@ function createExternalLangGraph() {
       const prompt = buildGraphFinalPrompt(state);
       const result = await withLangSmithChild(
         langsmith,
-        "LangGraph Node: agent_final",
+        "LangGraph Node: agent_draft",
         "llm",
         {
           model: GEMINI_MODEL,
@@ -384,7 +389,7 @@ function createExternalLangGraph() {
           observation: state.observation
         },
         {
-          graph_node: "agent_final",
+          graph_node: "agent_draft",
           ls_provider: "google_genai",
           ls_model_name: GEMINI_MODEL,
           agent_id: state.agent.agent_id,
@@ -404,16 +409,112 @@ function createExternalLangGraph() {
           text_chars: (result.text || "").length
         })
       );
+      const draftAnswer = normalizeGraphFinalAnswer(result.text, state);
+      trace?.push(step("langgraph", "node_agent_draft", {
+        model: GEMINI_MODEL,
+        text_chars: draftAnswer.length,
+        answer_preview: previewText(draftAnswer)
+      }));
+      return {
+        draftAnswer,
+        llmRaw: result.raw || null,
+        graphEvents: [{ node: "agent_draft", text_chars: draftAnswer.length }]
+      };
+    })
+    .addNode("critic_feedback", async (state, config) => {
+      const configurable = config.configurable || {};
+      const { langsmith, trace } = configurable;
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: critic_feedback",
+        "chain",
+        {
+          enabled: AI_FEEDBACK_ENABLED,
+          input: state.input,
+          draft_chars: (state.draftAnswer || "").length
+        },
+        { graph_node: "critic_feedback", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => ({ criticFeedback: await collectAiCriticFeedback(state) }),
+        (result) => ({
+          enabled: result.criticFeedback.enabled,
+          configured: result.criticFeedback.configured,
+          review_count: result.criticFeedback.reviews.length,
+          providers: result.criticFeedback.reviews.map((review) => review.provider),
+          errors: result.criticFeedback.errors
+        })
+      );
+      const feedback = result.criticFeedback;
+      trace?.push(step("langgraph", "node_critic_feedback", {
+        enabled: feedback.enabled,
+        configured: feedback.configured,
+        review_count: feedback.reviews.length,
+        providers: feedback.reviews.map((review) => review.provider),
+        feedback_preview: previewText(formatCriticFeedback(feedback), 640),
+        errors: feedback.errors.slice(0, 3)
+      }));
+      return {
+        criticFeedback: feedback,
+        graphEvents: [{
+          node: "critic_feedback",
+          enabled: feedback.enabled,
+          configured: feedback.configured,
+          review_count: feedback.reviews.length,
+          providers: feedback.reviews.map((review) => review.provider),
+          errors: feedback.errors.slice(0, 3)
+        }]
+      };
+    })
+    .addNode("agent_final", async (state, config) => {
+      const configurable = config.configurable || {};
+      const dryRun = configurable.dryRun === true || state.dryRun === true;
+      const geminiKey = configurable.geminiKey || process.env.GEMINI_API_KEY || "";
+      const { langsmith, trace } = configurable;
+      const hasExternalFeedback = criticFeedbackHasReviews(state.criticFeedback);
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: agent_final",
+        hasExternalFeedback ? "llm" : "chain",
+        {
+          model: GEMINI_MODEL,
+          input: state.input,
+          draft_chars: (state.draftAnswer || "").length,
+          critic_feedback: summarizeCriticFeedbackForTrace(state.criticFeedback)
+        },
+        {
+          graph_node: "agent_final",
+          ls_provider: hasExternalFeedback ? "google_genai" : "internal",
+          ls_model_name: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
+          agent_id: state.agent.agent_id,
+          okf_key: state.okfKey
+        },
+        async () => {
+          if (!hasExternalFeedback || dryRun) {
+            return { raw: null, text: state.draftAnswer || buildDeterministicGraphSections(state), revised: false };
+          }
+          if (!geminiKey) {
+            throw new Error("GEMINI_API_KEY is not available to revise the critic-reviewed draft");
+          }
+          const revisionPrompt = buildGraphRevisionPrompt(state);
+          const llmResult = await callGemini(geminiKey, revisionPrompt);
+          return { ...llmResult, revised: true };
+        },
+        (result) => ({
+          model: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
+          revised: Boolean(result.revised),
+          text_chars: (result.text || "").length
+        })
+      );
       const finalAnswer = normalizeGraphFinalAnswer(result.text, state);
       trace?.push(step("langgraph", "node_agent_final", {
-        model: GEMINI_MODEL,
+        model: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
+        revised_with_critic_feedback: Boolean(result.revised),
         text_chars: finalAnswer.length,
         answer_preview: previewText(finalAnswer)
       }));
       return {
         finalAnswer,
-        llmRaw: result.raw || null,
-        graphEvents: [{ node: "agent_final", text_chars: finalAnswer.length }]
+        llmRaw: result.raw || state.llmRaw || null,
+        graphEvents: [{ node: "agent_final", revised_with_critic_feedback: Boolean(result.revised), text_chars: finalAnswer.length }]
       };
     })
     .addEdge(START, "load_okf")
@@ -424,7 +525,9 @@ function createExternalLangGraph() {
     .addEdge("agent_reflection", "agent_followup_question")
     .addEdge("agent_followup_question", "tool_followups")
     .addEdge("tool_followups", "agent_synthesis")
-    .addEdge("agent_synthesis", "agent_final")
+    .addEdge("agent_synthesis", "agent_draft")
+    .addEdge("agent_draft", "critic_feedback")
+    .addEdge("critic_feedback", "agent_final")
     .addEdge("agent_final", END)
     .compile();
 }
@@ -460,7 +563,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
       history_messages: messages.length,
-      discourse_turns: Math.max(0, (result.graphEvents || []).filter((event) => /^agent_|^tool_/.test(event.node || "")).length)
+      discourse_turns: Math.max(0, (result.graphEvents || []).filter((event) => /^agent_|^tool_|^critic_/.test(event.node || "")).length)
     }
   };
 }
@@ -1122,6 +1225,283 @@ function buildGraphFinalPrompt(state) {
     requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer concise, practical, and readable.",
     "- Do not reveal internal node names unless the user explicitly asks for debugging."
   ].join("\n");
+}
+
+function buildGraphRevisionPrompt(state) {
+  const requiresJson = agentRequiresJsonOutput(state.agent);
+  return [
+    state.agent.okf.system_prompt,
+    "",
+    "You are the final revision node in a LangGraph ReAct executor.",
+    "You have a draft answer and independent AI critic feedback.",
+    "Revise the draft only where the feedback improves correctness, completeness, clarity, or safety.",
+    "Preserve grounded facts, exact CRUDX IDs, and exact URLs from the draft or tool observations.",
+    requiresJson
+      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence."
+      : "Return only the final user-facing answer. Do not output JSON, Markdown code fences, trace data, or hidden chain-of-thought.",
+    "Do not mention that competing AIs reviewed the answer unless the user explicitly asks about the feedback loop.",
+    "",
+    `Current user input: ${state.input}`,
+    "",
+    "Prior conversation:",
+    buildConversationContext(state.messages || []),
+    "",
+    "Graph synthesis:",
+    state.synthesis || "none",
+    "",
+    "Tool observations:",
+    [
+      state.observation || "",
+      formatFollowupObservations(state.followupObservations)
+    ].filter(Boolean).join("\n") || "none",
+    "",
+    "Draft answer:",
+    state.draftAnswer || "none",
+    "",
+    "Independent critic feedback:",
+    formatCriticFeedback(state.criticFeedback),
+    "",
+    "Revision requirements:",
+    "- Answer the user's latest question directly.",
+    "- Use conversation history only when relevant.",
+    "- Separate known facts, missing evidence, and recommendations where the question asks for it.",
+    "- If a critic suggested unsupported facts, ignore them.",
+    "- If no critic suggestion is useful, keep the draft essentially unchanged."
+  ].join("\n");
+}
+
+async function collectAiCriticFeedback(state) {
+  if (!AI_FEEDBACK_ENABLED) {
+    return {
+      enabled: false,
+      configured: false,
+      reviews: [],
+      errors: [],
+      summary: "AI feedback loop is disabled by AI_FEEDBACK_ENABLED=false."
+    };
+  }
+  const providers = configuredCriticProviders().slice(0, Math.max(1, AI_FEEDBACK_MAX_CRITICS));
+  if (!providers.length) {
+    return {
+      enabled: true,
+      configured: false,
+      reviews: [],
+      errors: [],
+      summary: "No external AI critic provider is configured. Set OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, or XAI_API_KEY in the runtime environment to enable cross-model review."
+    };
+  }
+
+  const prompt = buildCriticPrompt(state);
+  const reviews = [];
+  const errors = [];
+  for (const provider of providers) {
+    try {
+      const review = await callCriticProvider(provider, prompt);
+      reviews.push(review);
+    } catch (error) {
+      errors.push(`${provider.provider}/${provider.model}: ${error.message || error}`);
+    }
+  }
+  return {
+    enabled: true,
+    configured: providers.length > 0,
+    reviews,
+    errors,
+    summary: reviews.length
+      ? `${reviews.length} external critic review(s) received.`
+      : "External critic providers are configured, but no review was returned."
+  };
+}
+
+function configuredCriticProviders() {
+  const providers = [];
+  const openRouterKey = process.env.OPENROUTER_API_KEY || "";
+  if (openRouterKey) {
+    const models = String(process.env.OPENROUTER_CRITIC_MODELS || "deepseek/deepseek-chat,openai/gpt-4o-mini")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    for (const model of models) {
+      providers.push({
+        provider: "openrouter",
+        model,
+        apiKey: openRouterKey,
+        baseUrl: "https://openrouter.ai/api/v1"
+      });
+    }
+  }
+  if (process.env.OPENAI_API_KEY) {
+    providers.push({
+      provider: "openai",
+      model: process.env.OPENAI_CRITIC_MODEL || "gpt-4o-mini",
+      apiKey: process.env.OPENAI_API_KEY,
+      baseUrl: "https://api.openai.com/v1"
+    });
+  }
+  if (process.env.DEEPSEEK_API_KEY) {
+    providers.push({
+      provider: "deepseek",
+      model: process.env.DEEPSEEK_CRITIC_MODEL || "deepseek-chat",
+      apiKey: process.env.DEEPSEEK_API_KEY,
+      baseUrl: "https://api.deepseek.com/v1"
+    });
+  }
+  if (process.env.XAI_API_KEY) {
+    providers.push({
+      provider: "xai",
+      model: process.env.XAI_CRITIC_MODEL || "grok-3-mini",
+      apiKey: process.env.XAI_API_KEY,
+      baseUrl: "https://api.x.ai/v1"
+    });
+  }
+  if (process.env.ANTHROPIC_API_KEY) {
+    providers.push({
+      provider: "anthropic",
+      model: process.env.ANTHROPIC_CRITIC_MODEL || "claude-3-5-sonnet-latest",
+      apiKey: process.env.ANTHROPIC_API_KEY
+    });
+  }
+  return providers;
+}
+
+function buildCriticPrompt(state) {
+  return [
+    "You are an independent answer-quality critic for an agent platform.",
+    "Review the candidate answer against the user request and the supplied grounded evidence.",
+    "Do not invent facts. If the evidence is too thin, say so.",
+    "Return concise feedback with these sections: score_1_to_10, strengths, issues, concrete_improvements, better_answer.",
+    "",
+    `Agent: ${state.agent?.meta?.name || state.agent?.agent_id || "unknown"}`,
+    `User request: ${state.input}`,
+    "",
+    "Prior conversation:",
+    buildConversationContext(state.messages || []),
+    "",
+    "Grounded evidence:",
+    [
+      state.contextReview ? `Context review: ${state.contextReview}` : "",
+      state.observation ? `Primary observation: ${state.observation}` : "",
+      formatFollowupObservations(state.followupObservations) ? `Follow-up observations: ${formatFollowupObservations(state.followupObservations)}` : "",
+      state.synthesis ? `Synthesis: ${state.synthesis}` : ""
+    ].filter(Boolean).join("\n") || "none",
+    "",
+    "Candidate answer:",
+    state.draftAnswer || "none"
+  ].join("\n");
+}
+
+async function callCriticProvider(provider, prompt) {
+  if (provider.provider === "anthropic") {
+    return await callAnthropicCritic(provider, prompt);
+  }
+  return await callOpenAiCompatibleCritic(provider, prompt);
+}
+
+async function callOpenAiCompatibleCritic(provider, prompt) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_FEEDBACK_TIMEOUT_MS);
+  try {
+    const headers = {
+      "Authorization": `Bearer ${provider.apiKey}`,
+      "Content-Type": "application/json"
+    };
+    if (provider.provider === "openrouter") {
+      headers["HTTP-Referer"] = "https://crudx.local/react-aaas";
+      headers["X-Title"] = "CRUDX ReAct AaaS";
+    }
+    const response = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: provider.model,
+        temperature: 0.1,
+        max_tokens: 900,
+        messages: [
+          { role: "system", content: "You are a terse, evidence-aware answer-quality reviewer." },
+          { role: "user", content: prompt }
+        ]
+      })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || response.statusText);
+    const text = body.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error("critic response did not contain text");
+    return {
+      provider: provider.provider,
+      model: provider.model,
+      text: text.slice(0, 5000)
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function callAnthropicCritic(provider, prompt) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_FEEDBACK_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": provider.apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: provider.model,
+        temperature: 0.1,
+        max_tokens: 900,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || response.statusText);
+    const text = (body.content || []).map((part) => part.text || "").join("").trim();
+    if (!text) throw new Error("critic response did not contain text");
+    return {
+      provider: provider.provider,
+      model: provider.model,
+      text: text.slice(0, 5000)
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function criticFeedbackHasReviews(feedback) {
+  return Array.isArray(feedback?.reviews) && feedback.reviews.length > 0;
+}
+
+function formatCriticFeedback(feedback) {
+  if (!feedback) return "No critic feedback available.";
+  const lines = [
+    `Status: ${feedback.summary || "No summary."}`
+  ];
+  if (Array.isArray(feedback.reviews) && feedback.reviews.length) {
+    for (const review of feedback.reviews) {
+      lines.push("");
+      lines.push(`Critic ${review.provider}/${review.model}:`);
+      lines.push(String(review.text || "").trim());
+    }
+  }
+  if (Array.isArray(feedback.errors) && feedback.errors.length) {
+    lines.push("");
+    lines.push(`Critic errors: ${feedback.errors.slice(0, 5).join(" | ")}`);
+  }
+  return lines.join("\n").trim();
+}
+
+function summarizeCriticFeedbackForTrace(feedback) {
+  if (!feedback) return { configured: false, review_count: 0 };
+  return {
+    enabled: Boolean(feedback.enabled),
+    configured: Boolean(feedback.configured),
+    review_count: Array.isArray(feedback.reviews) ? feedback.reviews.length : 0,
+    providers: Array.isArray(feedback.reviews) ? feedback.reviews.map((review) => review.provider) : [],
+    errors: Array.isArray(feedback.errors) ? feedback.errors.slice(0, 3) : []
+  };
 }
 
 function normalizeGraphFinalAnswer(text, state) {
@@ -1857,7 +2237,7 @@ async function postLangGraphSpans(langsmith, graphResult, trace) {
 
   for (const event of events) {
     const node = String(event?.node || "unknown_node");
-    const runType = node === "agent_final" ? "llm" : node.startsWith("tool_") ? "tool" : node === "load_okf" ? "retriever" : "chain";
+    const runType = node === "agent_final" || node === "agent_draft" ? "llm" : node.startsWith("tool_") ? "tool" : node === "load_okf" ? "retriever" : "chain";
     await withLangSmithChild(
       langsmith,
       `LangGraph Node: ${node}`,
