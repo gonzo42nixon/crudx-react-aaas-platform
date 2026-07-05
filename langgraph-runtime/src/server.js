@@ -1065,10 +1065,22 @@ function buildGraphFinalPrompt(state) {
         "- Handoff answers must include severity, affected systems, suspected root cause, actions taken, open questions, and escalation recommendation."
       ].join("\n")
     : "";
+  const locationRequirements = isLocationAgent(state.agent)
+    ? [
+        "",
+        "Requestor-location answer discipline:",
+        "- Answer the current location question directly first.",
+        "- Treat consented browser geolocation or explicit coordinates as high-confidence evidence.",
+        "- If Google Maps reverse geocoding returned an address, use it as the location label and mention that it came from consented browser geolocation.",
+        "- If only time zone, locale, or headers are available, explicitly label the result as low or medium confidence.",
+        "- Do not ask the user to paste coordinates when the graph state already contains consented browser geolocation evidence."
+      ].join("\n")
+    : "";
   return [
     state.agent.okf.system_prompt,
     academicRequirements,
     opsRequirements,
+    locationRequirements,
     "",
     "You are the final response node in a multi-step LangGraph ReAct executor.",
     "Use the supplied graph state, OKF knowledge, and prior conversation.",
@@ -1353,6 +1365,9 @@ function buildDeterministicGraphSections(state) {
       .filter((part) => part && !/^No observation available/i.test(part));
     if (!snippets.length) {
       return "I could not determine the requestor location reliably from the available context. Please provide an explicit place or consented browser geolocation if a more precise estimate is required.";
+    }
+    if (/consented browser geolocation|reverse geocoding|Google Maps|Confidence:\s*high/i.test(snippets.join(" "))) {
+      return snippets.join(" ");
     }
     return `${snippets.join(" ")} For greater precision, pass explicit coordinates or ask the requestor to share browser geolocation with consent.`;
   }

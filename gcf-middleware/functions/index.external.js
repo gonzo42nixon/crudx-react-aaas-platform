@@ -12,6 +12,7 @@ const LANGGRAPH_RUNTIME_URL = defineString("LANGGRAPH_RUNTIME_URL", { default: "
 const LANGGRAPH_RUNTIME_TOKEN = defineSecret("LANGGRAPH_RUNTIME_TOKEN");
 const LANGGRAPH_RUNTIME_MODE = defineString("LANGGRAPH_RUNTIME_MODE", { default: "standalone" });
 const LANGGRAPH_ASSISTANT_ID = defineString("LANGGRAPH_ASSISTANT_ID", { default: "agent" });
+const GOOGLE_MAPS_API_KEY = defineSecret("GOOGLE_MAPS_API_KEY");
 const CRUDX_ID_RE = /^CRUDX-[RDUCX23458]{5}-[RDUCX23458]{5}-[RDUCX23458]{5}$/;
 const CRUDX_ALPHABET = "RDUCX23458";
 const CRUDX_OWNER = "drueffler@gmail.com";
@@ -211,6 +212,64 @@ exports.searchKnowledgeBase = onRequest(
   }
 );
 
+exports.academicLiteratureSearch = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 45,
+    memory: "512MiB"
+  },
+  async (req, res) => {
+    setCors(res);
+    if (handlePreflightOrReject(req, res)) return;
+
+    try {
+      const body = normalizeToolRequest(req.body);
+      const query = String(body.parameters?.query || body.parameters?.paper_title || body.query || "").trim();
+      const doi = String(body.parameters?.doi_or_url || body.parameters?.doi || "").trim();
+      const paperTitle = String(body.parameters?.paper_title || inferQuotedTitle(query) || "").trim();
+      const maxResults = clampInteger(body.parameters?.max_results || body.parameters?.rows || 5, 1, 10);
+
+      if (!query && !doi) {
+        res.status(200).json({
+          ok: true,
+          tool: "academic_literature_search",
+          needs_input: true,
+          sources: ["crossref", "arxiv"],
+          results: [],
+          observation: "Live literature search needs a paper title, DOI, URL, or research question."
+        });
+        return;
+      }
+
+      const [crossref, arxiv] = await Promise.allSettled([
+        searchCrossref(query || paperTitle || doi, doi, maxResults, paperTitle),
+        searchArxiv(paperTitle || query || doi, maxResults, Boolean(paperTitle))
+      ]);
+      const crossrefResults = crossref.status === "fulfilled" ? crossref.value : [];
+      const arxivResults = arxiv.status === "fulfilled" ? arxiv.value : [];
+      const results = mergeLiteratureResults([...crossrefResults, ...arxivResults]).slice(0, maxResults);
+      const errors = [
+        crossref.status === "rejected" ? `crossref: ${crossref.reason?.message || crossref.reason}` : null,
+        arxiv.status === "rejected" ? `arxiv: ${arxiv.reason?.message || arxiv.reason}` : null
+      ].filter(Boolean);
+
+      res.status(200).json({
+        ok: true,
+        tool: "academic_literature_search",
+        query: query || doi,
+        sources: ["crossref", "arxiv"],
+        result_count: results.length,
+        results,
+        errors,
+        observation: buildLiteratureObservation(results, errors)
+      });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  }
+);
+
 exports.calculateDays = onRequest(
   {
     region: REGION,
@@ -306,7 +365,8 @@ exports.requestorLocation = onRequest(
     region: REGION,
     cors: true,
     timeoutSeconds: 30,
-    memory: "256MiB"
+    memory: "256MiB",
+    secrets: [GOOGLE_MAPS_API_KEY]
   },
   async (req, res) => {
     setCors(res);
@@ -316,10 +376,18 @@ exports.requestorLocation = onRequest(
       const body = normalizeToolRequest(req.body);
       const context = buildRequestContext(req, body.parameters?.request_context || body.meta?.request_context);
       const explicitLocation = inferExplicitLocation(body);
-      const location = explicitLocation || inferLocationFromContext(context);
+      const consentedCoordinates = inferConsentedCoordinates(body, context);
+      const reverseGeocoded = !explicitLocation && consentedCoordinates
+        ? await reverseGeocodeWithGoogleMaps(consentedCoordinates, GOOGLE_MAPS_API_KEY.value())
+        : null;
+      const location = explicitLocation || reverseGeocoded || inferLocationFromContext(context);
       const confidence = explicitLocation ? "high" : location ? location.confidence : "none";
       const evidence = [
         explicitLocation ? "explicit user-supplied location" : null,
+        consentedCoordinates ? "consented browser geolocation coordinates" : null,
+        consentedCoordinates?.accuracy_m ? `browser geolocation accuracy: +/- ${Math.round(Number(consentedCoordinates.accuracy_m))}m` : null,
+        reverseGeocoded?.reverse_geocoded ? "Google Maps reverse geocoding succeeded" : null,
+        consentedCoordinates && !reverseGeocoded?.reverse_geocoded ? "Google Maps reverse geocoding unavailable; coordinates retained" : null,
         context.time_zone ? `browser time zone: ${context.time_zone}` : null,
         context.language ? `browser language: ${context.language}` : null,
         context.country ? `request country header: ${context.country}` : null,
@@ -482,6 +550,227 @@ function normalizeToolRequest(rawBody) {
   };
 }
 
+async function searchCrossref(query, doiOrUrl, maxResults, paperTitle = "") {
+  const doi = extractDoi(doiOrUrl || query);
+  const base = doi
+    ? `https://api.crossref.org/works/${encodeURIComponent(doi)}`
+    : paperTitle
+      ? `https://api.crossref.org/works?rows=${maxResults}&query.title=${encodeURIComponent(paperTitle)}&select=DOI,title,author,issued,published-print,published-online,container-title,URL,type,is-referenced-by-count,abstract`
+      : `https://api.crossref.org/works?rows=${maxResults}&query.bibliographic=${encodeURIComponent(query)}&select=DOI,title,author,issued,published-print,published-online,container-title,URL,type,is-referenced-by-count,abstract`;
+  const response = await fetch(base, {
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "CRUDX-ReAct-AaaS/0.1 (mailto:drueffler@gmail.com)"
+    }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.message || response.statusText);
+  const message = payload.message || {};
+  const items = doi ? [message] : Array.isArray(message.items) ? message.items : [];
+  return items.map((item) => ({
+    source: "crossref",
+    title: firstText(item.title),
+    authors: normalizeCrossrefAuthors(item.author),
+    year: extractCrossrefYear(item),
+    doi: item.DOI || null,
+    url: item.URL || (item.DOI ? `https://doi.org/${item.DOI}` : null),
+    venue: firstText(item["container-title"]),
+    type: item.type || null,
+    citation_count_hint: Number.isFinite(item["is-referenced-by-count"]) ? item["is-referenced-by-count"] : null,
+    abstract: stripTags(item.abstract || "").slice(0, 900)
+  })).filter((item) => item.title || item.doi || item.url);
+}
+
+async function searchArxiv(query, maxResults, titleSearch = false) {
+  const searchQuery = titleSearch ? `ti:"${query}"` : `all:${query}`;
+  const response = await fetch(`https://export.arxiv.org/api/query?search_query=${encodeURIComponent(searchQuery)}&start=0&max_results=${maxResults}&sortBy=relevance&sortOrder=descending`, {
+    headers: {
+      "Accept": "application/atom+xml",
+      "User-Agent": "CRUDX-ReAct-AaaS/0.1 (mailto:drueffler@gmail.com)"
+    }
+  });
+  const xml = await response.text();
+  if (!response.ok) throw new Error(response.statusText);
+  return parseArxivEntries(xml).map((entry) => ({
+    source: "arxiv",
+    title: entry.title,
+    authors: entry.authors,
+    year: entry.published ? Number(entry.published.slice(0, 4)) : null,
+    doi: entry.doi || null,
+    url: entry.id || null,
+    venue: "arXiv",
+    type: "preprint",
+    citation_count_hint: null,
+    abstract: entry.summary.slice(0, 900),
+    arxiv_id: extractArxivId(entry.id)
+  })).filter((item) => item.title || item.url);
+}
+
+function parseArxivEntries(xml) {
+  const entries = [];
+  const blocks = String(xml || "").match(/<entry\b[\s\S]*?<\/entry>/g) || [];
+  for (const block of blocks) {
+    entries.push({
+      id: decodeXml(firstXmlTag(block, "id")),
+      title: normalizeWhitespace(decodeXml(firstXmlTag(block, "title"))),
+      summary: normalizeWhitespace(decodeXml(firstXmlTag(block, "summary"))),
+      published: decodeXml(firstXmlTag(block, "published")),
+      doi: decodeXml(firstXmlTag(block, "arxiv:doi") || firstXmlTag(block, "doi")),
+      authors: Array.from(block.matchAll(/<author\b[\s\S]*?<name>([\s\S]*?)<\/name>[\s\S]*?<\/author>/g))
+        .map((match) => normalizeWhitespace(decodeXml(match[1])))
+        .filter(Boolean)
+        .slice(0, 8)
+    });
+  }
+  return entries;
+}
+
+function mergeLiteratureResults(items) {
+  const byWork = new Map();
+  for (const item of items) {
+    const key = literatureWorkKey(item);
+    if (!key) continue;
+    const previous = byWork.get(key);
+    if (!previous) {
+      byWork.set(key, item);
+      continue;
+    }
+    byWork.set(key, preferLiteratureRecord(previous, item));
+  }
+  return Array.from(byWork.values()).sort((left, right) => scoreLiteratureRecord(right) - scoreLiteratureRecord(left));
+}
+
+function literatureWorkKey(item) {
+  const title = normalizeLiteratureTitle(item.title);
+  const firstAuthor = normalizeLiteratureTitle(item.authors?.[0] || "");
+  if (title && firstAuthor) return `${title}:${firstAuthor}`;
+  return String(item.doi || item.arxiv_id || item.url || "").toLowerCase().trim();
+}
+
+function preferLiteratureRecord(left, right) {
+  const leftScore = scoreLiteratureRecord(left);
+  const rightScore = scoreLiteratureRecord(right);
+  if (rightScore > leftScore) return mergeLiteratureRecord(right, left);
+  return mergeLiteratureRecord(left, right);
+}
+
+function mergeLiteratureRecord(primary, secondary) {
+  return {
+    ...primary,
+    source: Array.from(new Set([primary.source, secondary.source].flat().filter(Boolean))).join("+"),
+    doi: primary.doi || secondary.doi || null,
+    arxiv_id: primary.arxiv_id || secondary.arxiv_id || null,
+    url: primary.url || secondary.url || null,
+    citation_count_hint: Number.isFinite(primary.citation_count_hint)
+      ? primary.citation_count_hint
+      : Number.isFinite(secondary.citation_count_hint)
+        ? secondary.citation_count_hint
+        : null,
+    abstract: primary.abstract || secondary.abstract || ""
+  };
+}
+
+function scoreLiteratureRecord(item) {
+  let score = 0;
+  if (item.source === "arxiv" || String(item.source || "").includes("arxiv")) score += 10;
+  if (item.doi) score += 5;
+  if (item.arxiv_id) score += 5;
+  if (item.abstract) score += 3;
+  if (Number.isFinite(item.citation_count_hint)) score += Math.min(3, item.citation_count_hint / 100);
+  if (item.year && item.year < 2024) score += 2;
+  return score;
+}
+
+function normalizeLiteratureTitle(value) {
+  return normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function buildLiteratureObservation(results, errors) {
+  if (!results.length) {
+    return errors.length
+      ? `Live literature search returned no usable results. Source errors: ${errors.join("; ")}.`
+      : "Live literature search returned no usable Crossref or arXiv results for this query.";
+  }
+  const lines = results.slice(0, 5).map((item, index) => {
+    const authors = item.authors?.length ? item.authors.slice(0, 3).join(", ") : "unknown authors";
+    const year = item.year || "n.d.";
+    const identifiers = [
+      item.arxiv_id ? `arXiv ${item.arxiv_id}` : "",
+      item.doi ? `Crossref DOI hint ${item.doi}` : ""
+    ].filter(Boolean);
+    const id = identifiers.length ? ` ${identifiers.join("; ")}` : "";
+    const cites = Number.isFinite(item.citation_count_hint) ? ` Crossref cited-by hint ${item.citation_count_hint}.` : "";
+    return `${index + 1}. ${item.title || "Untitled"} (${year}) by ${authors}.${id}.${cites}`;
+  });
+  const suffix = errors.length ? ` Source warnings: ${errors.join("; ")}.` : "";
+  return `Live literature search found ${results.length} result(s) from Crossref/arXiv: ${lines.join(" ")}${suffix}`;
+}
+
+function inferQuotedTitle(value) {
+  const match = /"([^"]{6,180})"/.exec(String(value || ""))
+    || /'([^']{6,180})'/.exec(String(value || ""));
+  return match ? match[1].trim() : "";
+}
+
+function extractDoi(value) {
+  const match = /\b(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)\b/i.exec(String(value || ""));
+  return match ? match[1].replace(/[.,;)\]]+$/, "") : "";
+}
+
+function extractArxivId(value) {
+  const match = /arxiv\.org\/abs\/([^/?#]+)/i.exec(String(value || ""));
+  return match ? match[1] : null;
+}
+
+function normalizeCrossrefAuthors(authors) {
+  if (!Array.isArray(authors)) return [];
+  return authors.map((author) => [author.given, author.family].filter(Boolean).join(" ").trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function extractCrossrefYear(item) {
+  const dateParts = item?.issued?.["date-parts"] || item?.["published-print"]?.["date-parts"] || item?.["published-online"]?.["date-parts"];
+  return Array.isArray(dateParts) && Array.isArray(dateParts[0]) ? Number(dateParts[0][0]) || null : null;
+}
+
+function firstText(value) {
+  return Array.isArray(value) ? String(value[0] || "").trim() : String(value || "").trim();
+}
+
+function firstXmlTag(xml, tag) {
+  const pattern = new RegExp(`<${escapeRegex(tag)}\\b[^>]*>([\\s\\S]*?)<\\/${escapeRegex(tag)}>`, "i");
+  const match = pattern.exec(String(xml || ""));
+  return match ? match[1] : "";
+}
+
+function decodeXml(value) {
+  return String(value || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function normalizeWhitespace(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function stripTags(value) {
+  return normalizeWhitespace(decodeXml(String(value || "").replace(/<[^>]+>/g, " ")));
+}
+
+function clampInteger(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(number)));
+}
+
 function buildRequestContext(req, clientContext) {
   const forwardedFor = String(req.headers["x-forwarded-for"] || "").split(",").map((item) => item.trim()).filter(Boolean);
   const source = typeof clientContext === "object" && clientContext ? clientContext : {};
@@ -496,6 +785,7 @@ function buildRequestContext(req, clientContext) {
     time_zone: String(source.time_zone || source.timeZone || "").trim(),
     language: String(source.language || "").trim(),
     languages: Array.isArray(source.languages) ? source.languages.slice(0, 6).map(String) : [],
+    browser_geolocation: sanitizeBrowserGeolocation(source.browser_geolocation || source.browserGeolocation),
     user_agent: String(source.user_agent || source.userAgent || req.headers["user-agent"] || "").slice(0, 300),
     url: String(source.url || "").slice(0, 500)
   };
@@ -535,6 +825,87 @@ function inferCoordinates(parameters) {
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
   if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
   return { latitude, longitude };
+}
+
+function sanitizeBrowserGeolocation(value) {
+  const source = typeof value === "object" && value ? value : null;
+  if (!source) return null;
+  const latitude = Number(source.latitude ?? source.lat);
+  const longitude = Number(source.longitude ?? source.lon ?? source.lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return {
+    consent: source.consent === true,
+    source: "browser_geolocation",
+    latitude,
+    longitude,
+    accuracy_m: source.accuracy_m ?? source.accuracy ?? null,
+    captured_at: String(source.captured_at || source.timestamp || "").slice(0, 80)
+  };
+}
+
+function inferConsentedCoordinates(body, context) {
+  const parameters = body.parameters || {};
+  const direct = inferCoordinates(parameters);
+  if (direct) {
+    return {
+      ...direct,
+      accuracy_m: parameters.accuracy_m || parameters.accuracy || null,
+      source: "explicit_coordinates"
+    };
+  }
+  const candidates = [
+    parameters.request_context?.browser_geolocation,
+    parameters.browser_geolocation,
+    body.meta?.request_context?.browser_geolocation,
+    context.browser_geolocation
+  ];
+  for (const candidate of candidates) {
+    const geo = sanitizeBrowserGeolocation(candidate);
+    if (geo && geo.consent === true) return geo;
+  }
+  return null;
+}
+
+async function reverseGeocodeWithGoogleMaps(coords, apiKey) {
+  const fallback = {
+    label: `${coords.latitude}, ${coords.longitude}`,
+    latitude: coords.latitude,
+    longitude: coords.longitude,
+    accuracy_m: coords.accuracy_m || null,
+    source: coords.source || "browser_geolocation",
+    confidence: "high",
+    reverse_geocoded: false
+  };
+  const key = String(apiKey || "").trim();
+  if (/^(?:NOT_CONFIGURED|CHANGE_ME|PLACEHOLDER)$/i.test(key)) return fallback;
+  if (!key) return fallback;
+
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set("latlng", `${coords.latitude},${coords.longitude}`);
+  url.searchParams.set("key", key);
+  url.searchParams.set("language", "en");
+
+  const response = await fetch(url);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.status !== "OK" || !Array.isArray(payload.results) || !payload.results.length) {
+    return {
+      ...fallback,
+      google_status: payload.status || response.statusText || "UNKNOWN"
+    };
+  }
+
+  const result = payload.results[0] || {};
+  return {
+    ...fallback,
+    label: result.formatted_address || fallback.label,
+    formatted_address: result.formatted_address || null,
+    place_id: result.place_id || null,
+    location_type: result.geometry?.location_type || null,
+    source: "browser_geolocation_google_reverse_geocode",
+    reverse_geocoded: true,
+    google_status: payload.status
+  };
 }
 
 function inferLocationFromContext(context) {
