@@ -108,14 +108,20 @@ async function invokeGraph(requestBody, options = {}) {
   const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
   const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
   const okfEnvelope = requestBody.okf_envelope || requestBody.okfEnvelope;
-  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const incomingMetadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const threadId = extractThreadId(requestBody, okfKey, runKey);
+  const metadata = {
+    ...incomingMetadata,
+    thread_id: threadId,
+    session_id: incomingMetadata.session_id || incomingMetadata.sessionId || threadId
+  };
   const trace = createTraceCollector(options.onTrace);
-  trace.push(step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey }));
+  trace.push(step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey, thread_id: threadId }));
 
   if (!input) throw new Error("INPUT_REQUIRED");
   if (!okfEnvelope) throw new Error("OKF_ENVELOPE_REQUIRED");
 
-  const langsmith = createLangSmithTrace({ runKey, input, okfKey, dryRun });
+  const langsmith = createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata });
   await ensureLangSmithProject(langsmith);
   await postLangSmithRun(langsmith);
 
@@ -126,6 +132,7 @@ async function invokeGraph(requestBody, options = {}) {
       input,
       messages,
       dryRun,
+      threadId,
       metadata,
       langsmith,
       trace
@@ -143,6 +150,7 @@ async function invokeGraph(requestBody, options = {}) {
     return {
       ok: true,
       run_key: runKey,
+      thread_id: threadId,
       okf_key: okfKey,
       agent_id: graphResult.agent.agent_id,
       answer: graphResult.finalAnswer,
@@ -597,17 +605,17 @@ function createExternalLangGraph() {
     .compile();
 }
 
-async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, metadata, langsmith, trace }) {
+async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, threadId, metadata, langsmith, trace }) {
   const graph = createExternalLangGraph();
   const result = await withLangSmithChild(
     langsmith,
     "LangGraph Executor: external CRUDX OKF ReAct Graph",
     "chain",
-    { okf_key: okfKey, input, history_messages: messages.length },
-    { graph: "crudx_okf_react_discourse", okf_key: okfKey, runtime_boundary: "external" },
+    { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId },
+    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, runtime_boundary: "external" },
     () => graph.invoke(
       { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {} },
-      { configurable: { dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
+      { configurable: { thread_id: threadId, dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
     ),
     (state) => ({
       agent_id: state.agent?.agent_id || null,
@@ -624,6 +632,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
     graphSummary: {
       runtime: "external-langgraph-js",
       graph: "crudx_okf_react_discourse",
+      thread_id: threadId,
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
@@ -674,6 +683,38 @@ function normalizeMessages(rawMessages) {
     })
     .filter(Boolean)
     .slice(-10);
+}
+
+function extractThreadId(requestBody, okfKey, runKey) {
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  const raw = requestBody.thread_id
+    || requestBody.threadId
+    || requestBody.session_id
+    || requestBody.sessionId
+    || configurable.thread_id
+    || configurable.threadId
+    || metadata.thread_id
+    || metadata.threadId
+    || metadata.session_id
+    || metadata.sessionId;
+  const normalized = normalizeThreadId(raw);
+  if (normalized) return normalized;
+  return `crudx_${compactIdPart(okfKey || "okf")}_${compactIdPart(runKey || "run")}`;
+}
+
+function normalizeThreadId(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.replace(/[^A-Za-z0-9_.:-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 160);
+}
+
+function compactIdPart(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48) || "thread";
 }
 
 function buildConversationContext(messages) {
@@ -2410,7 +2451,7 @@ async function callGemini(apiKey, prompt) {
   return { raw: body, text };
 }
 
-function createLangSmithTrace({ runKey, input, okfKey, dryRun }) {
+function createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata = {} }) {
   const apiKey = process.env.LANGSMITH_API_KEY || "";
   if (!apiKey) return { enabled: false, reason: "LANGSMITH_API_KEY not configured", errors: [] };
   try {
@@ -2426,7 +2467,15 @@ function createLangSmithTrace({ runKey, input, okfKey, dryRun }) {
       project_name: LANGSMITH_PROJECT,
       client,
       tags: ["crudx", "react-aaas", "external-langgraph", "live"],
-      metadata: { okf_key: okfKey, run_key: runKey, dry_run: Boolean(dryRun), runtime: "external-langgraph" }
+      metadata: {
+        ...metadata,
+        okf_key: okfKey,
+        run_key: runKey,
+        thread_id: threadId,
+        session_id: metadata.session_id || metadata.sessionId || threadId,
+        dry_run: Boolean(dryRun),
+        runtime: "external-langgraph"
+      }
     });
     return {
       enabled: true,
@@ -2474,8 +2523,8 @@ async function postLangGraphSpans(langsmith, graphResult, trace) {
     langsmith,
     "LangGraph Executor: external crudx_okf_react_discourse",
     "chain",
-    { runtime: summary.runtime, graph: summary.graph, nodes: events.map((event) => event.node), action: summary.action || "none" },
-    { graph: summary.graph, runtime: summary.runtime, span_source: "external_graph_event_mirror" },
+    { runtime: summary.runtime, graph: summary.graph, thread_id: summary.thread_id, nodes: events.map((event) => event.node), action: summary.action || "none" },
+    { graph: summary.graph, runtime: summary.runtime, thread_id: summary.thread_id, span_source: "external_graph_event_mirror" },
     async () => ({ ok: true }),
     () => ({ ok: true, nodes: events.map((event) => event.node), action: summary.action || "none" })
   );
@@ -2488,7 +2537,7 @@ async function postLangGraphSpans(langsmith, graphResult, trace) {
       `LangGraph Node: ${node}`,
       runType,
       sanitizeLangSmithPayload(event || {}),
-      { graph: summary.graph, runtime: summary.runtime, graph_node: node, span_source: "external_graph_event_mirror" },
+      { graph: summary.graph, runtime: summary.runtime, thread_id: summary.thread_id, graph_node: node, span_source: "external_graph_event_mirror" },
       async () => ({ ok: true }),
       () => ({ ok: true, ...sanitizeLangSmithPayload(event || {}) })
     );

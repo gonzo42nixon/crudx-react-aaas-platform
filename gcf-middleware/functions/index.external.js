@@ -64,6 +64,7 @@ exports.reactAaasInvoke = onRequest(
     const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
     const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
+    const threadId = extractThreadId(requestBody, agentId, okfKey);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -89,7 +90,7 @@ exports.reactAaasInvoke = onRequest(
     }
 
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
-    const trace = [step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey })];
+    const trace = [step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId })];
 
     try {
       const okfEnvelope = await readCrudxEnvelope(okfKey);
@@ -102,9 +103,17 @@ exports.reactAaasInvoke = onRequest(
         input,
         messages,
         dry_run: dryRun,
+        thread_id: threadId,
+        session_id: threadId,
+        configurable: {
+          ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
+          thread_id: threadId
+        },
         okf_envelope: okfEnvelope,
         metadata: {
           ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
+          thread_id: threadId,
+          session_id: threadId,
           source: "gcf-react-aaas-middleware",
           runtime_boundary: "external-langgraph",
           received_at: startedAt,
@@ -129,6 +138,7 @@ exports.reactAaasInvoke = onRequest(
         updated_at: finishedAt,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
+        thread_id: threadId,
         input,
         messages,
         output: finalAnswer,
@@ -150,6 +160,7 @@ exports.reactAaasInvoke = onRequest(
       res.status(200).json({
         ok: true,
         run_key: runKey,
+        thread_id: threadId,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
         answer: finalAnswer,
@@ -228,6 +239,7 @@ exports.reactAaasStream = onRequest(
     const dryRun = requestBody.dry_run === true || requestBody.dryRun === true;
     const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
+    const threadId = extractThreadId(requestBody, agentId, okfKey);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -245,7 +257,7 @@ exports.reactAaasStream = onRequest(
     writeSseHeaders(res);
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
     const middlewareTrace = [
-      step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey })
+      step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId })
     ];
     writeSseEvent(res, "trace", middlewareTrace[0]);
 
@@ -262,9 +274,17 @@ exports.reactAaasStream = onRequest(
         input,
         messages,
         dry_run: dryRun,
+        thread_id: threadId,
+        session_id: threadId,
+        configurable: {
+          ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
+          thread_id: threadId
+        },
         okf_envelope: okfEnvelope,
         metadata: {
           ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
+          thread_id: threadId,
+          session_id: threadId,
           source: "gcf-react-aaas-stream",
           runtime_boundary: "external-langgraph",
           received_at: startedAt,
@@ -292,6 +312,7 @@ exports.reactAaasStream = onRequest(
         updated_at: finishedAt,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
+        thread_id: threadId,
         input,
         messages,
         output: finalAnswer,
@@ -314,6 +335,7 @@ exports.reactAaasStream = onRequest(
       writeSseEvent(res, "gcf_completed", {
         ok: true,
         run_key: runKey,
+        thread_id: threadId,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null
       });
@@ -1394,6 +1416,7 @@ function parseSseBlock(block) {
 async function invokeLangGraphApiRuntime(runtimeUrl, payload) {
   const token = String(LANGGRAPH_RUNTIME_TOKEN.value() || "");
   const assistantId = String(LANGGRAPH_ASSISTANT_ID.value() || "agent");
+  const requestedThreadId = normalizeThreadId(payload.thread_id || payload.metadata?.thread_id || "");
   const headers = {
     "Content-Type": "application/json",
     ...(token ? { Authorization: `Bearer ${token}` } : {})
@@ -1405,7 +1428,11 @@ async function invokeLangGraphApiRuntime(runtimeUrl, payload) {
     messages: payload.messages || [],
     dryRun: Boolean(payload.dry_run),
     runKey: payload.run_key,
-    metadata: payload.metadata || {}
+    thread_id: requestedThreadId,
+    metadata: {
+      ...(payload.metadata || {}),
+      thread_id: requestedThreadId || payload.metadata?.thread_id || null
+    }
   };
 
   const threadResponse = await fetch(`${runtimeUrl}/threads`, {
@@ -1425,9 +1452,11 @@ async function invokeLangGraphApiRuntime(runtimeUrl, payload) {
       assistant_id: assistantId,
       input: graphInput,
       metadata: {
+        ...(payload.metadata || {}),
         source: "gcf-react-aaas-middleware",
         okf_key: payload.okf_key,
-        run_key: payload.run_key
+        run_key: payload.run_key,
+        requested_thread_id: requestedThreadId || null
       }
     })
   });
@@ -1438,6 +1467,7 @@ async function invokeLangGraphApiRuntime(runtimeUrl, payload) {
 
   return normalizeLangGraphState(runBody, {
     threadId: threadBody.thread_id,
+    requestedThreadId,
     assistantId,
     runtimeUrl,
     payload
@@ -1461,19 +1491,21 @@ function normalizeLangGraphState(state, context) {
       graph: "crudx_okf_react_discourse",
       assistant_id: context.assistantId,
       thread_id: context.threadId,
+      requested_thread_id: context.requestedThreadId || null,
       nodes,
       action: state.action || "none",
       history_messages: Array.isArray(context.payload.messages) ? context.payload.messages.length : 0,
       discourse_turns: Math.max(0, events.filter((event) => /^agent_|^tool_/.test(event.node || "")).length)
     },
     trace: [
-      step("langgraph", "thread_created", { thread_id: context.threadId, assistant_id: context.assistantId }),
+      step("langgraph", "thread_created", { thread_id: context.threadId, requested_thread_id: context.requestedThreadId || null, assistant_id: context.assistantId }),
       step("langgraph", "run_completed", { nodes, action: state.action || "none" })
     ],
     langsmith: {
       enabled: true,
       project: "react-aaas-crudx",
       thread_id: context.threadId,
+      requested_thread_id: context.requestedThreadId || null,
       assistant_id: context.assistantId,
       run_url: null,
       project_url: null,
@@ -1611,6 +1643,38 @@ function normalizeMessages(rawMessages) {
     })
     .filter(Boolean)
     .slice(-10);
+}
+
+function extractThreadId(requestBody, agentId, okfKey) {
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  const raw = requestBody.thread_id
+    || requestBody.threadId
+    || requestBody.session_id
+    || requestBody.sessionId
+    || configurable.thread_id
+    || configurable.threadId
+    || metadata.thread_id
+    || metadata.threadId
+    || metadata.session_id
+    || metadata.sessionId;
+  const normalized = normalizeThreadId(raw);
+  if (normalized) return normalized;
+  return `crudx_${compactIdPart(agentId || "agent")}_${compactIdPart(okfKey || "okf")}`;
+}
+
+function normalizeThreadId(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.replace(/[^A-Za-z0-9_.:-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 160);
+}
+
+function compactIdPart(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48) || "thread";
 }
 
 function extractIsoDates(input) {
