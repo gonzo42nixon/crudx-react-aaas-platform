@@ -287,13 +287,23 @@ async function inspectCheckpoints(requestBody) {
     checkpoints.push(formatCheckpointTuple(tuple, checkpoints.length === 0));
   }
 
+  const namespaceSuggestions = new Set(checkpoints.map((item) => item.checkpoint_ns).filter(Boolean));
+  if (checkpoints.length === 0) {
+    for await (const tuple of checkpointer.list({ configurable: { thread_id: threadId } }, { limit: 20 })) {
+      const formatted = formatCheckpointTuple(tuple, checkpoints.length === 0);
+      checkpoints.push(formatted);
+      if (formatted.checkpoint_ns) namespaceSuggestions.add(formatted.checkpoint_ns);
+      if (checkpoints.length >= limit) break;
+    }
+  }
+
   const latestTuple = checkpointId
     ? await checkpointer.getTuple(baseConfig)
     : checkpoints.length
       ? await checkpointer.getTuple({
         configurable: {
           thread_id: threadId,
-          checkpoint_ns: checkpointNs,
+          checkpoint_ns: checkpoints[0].checkpoint_ns || checkpointNs,
           checkpoint_id: checkpoints[0].checkpoint_id
         }
       })
@@ -309,6 +319,8 @@ async function inspectCheckpoints(requestBody) {
     checkpoint_collection: LANGGRAPH_CHECKPOINT_COLLECTION,
     writes_collection: LANGGRAPH_CHECKPOINT_WRITES_COLLECTION,
     count: checkpoints.length,
+    exact_namespace_match: checkpoints.some((item) => item.checkpoint_ns === checkpointNs),
+    namespace_suggestions: Array.from(namespaceSuggestions),
     checkpoints,
     latest: latestTuple ? formatCheckpointTuple(latestTuple, true, { includePreview: true }) : null,
     note: "Values are decoded from the LangGraph checkpointer and redacted/truncated for UI inspection."
@@ -330,6 +342,7 @@ function formatCheckpointTuple(tuple, latest, options = {}) {
   }));
   return {
     latest: Boolean(latest),
+    checkpoint_ns: tuple?.config?.configurable?.checkpoint_ns || "",
     checkpoint_id: checkpointId,
     parent_checkpoint_id: parentCheckpointId,
     ts: checkpoint.ts || null,
