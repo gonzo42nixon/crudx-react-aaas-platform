@@ -65,6 +65,7 @@ exports.reactAaasInvoke = onRequest(
     const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
     const threadId = extractThreadId(requestBody, agentId, okfKey);
+    const agentMemoryId = extractAgentMemoryId(requestBody, agentId, okfKey);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -90,7 +91,7 @@ exports.reactAaasInvoke = onRequest(
     }
 
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
-    const trace = [step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId })];
+    const trace = [step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId, agent_memory_id: agentMemoryId })];
 
     try {
       const okfEnvelope = await readCrudxEnvelope(okfKey);
@@ -105,15 +106,20 @@ exports.reactAaasInvoke = onRequest(
         dry_run: dryRun,
         thread_id: threadId,
         session_id: threadId,
+        agent_memory_id: agentMemoryId,
+        persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
         configurable: {
           ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
-          thread_id: threadId
+          thread_id: threadId,
+          agent_memory_id: agentMemoryId
         },
         okf_envelope: okfEnvelope,
         metadata: {
           ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
           thread_id: threadId,
           session_id: threadId,
+          agent_memory_id: agentMemoryId,
+          persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
           source: "gcf-react-aaas-middleware",
           runtime_boundary: "external-langgraph",
           received_at: startedAt,
@@ -139,6 +145,7 @@ exports.reactAaasInvoke = onRequest(
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
         thread_id: threadId,
+        agent_memory_id: agentMemoryId,
         input,
         messages,
         output: finalAnswer,
@@ -161,6 +168,7 @@ exports.reactAaasInvoke = onRequest(
         ok: true,
         run_key: runKey,
         thread_id: threadId,
+        agent_memory_id: agentMemoryId,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
         answer: finalAnswer,
@@ -240,6 +248,7 @@ exports.reactAaasStream = onRequest(
     const messages = normalizeMessages(requestBody.messages || requestBody.history || []);
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
     const threadId = extractThreadId(requestBody, agentId, okfKey);
+    const agentMemoryId = extractAgentMemoryId(requestBody, agentId, okfKey);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -257,7 +266,7 @@ exports.reactAaasStream = onRequest(
     writeSseHeaders(res);
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
     const middlewareTrace = [
-      step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId })
+      step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId, agent_memory_id: agentMemoryId })
     ];
     writeSseEvent(res, "trace", middlewareTrace[0]);
 
@@ -276,15 +285,20 @@ exports.reactAaasStream = onRequest(
         dry_run: dryRun,
         thread_id: threadId,
         session_id: threadId,
+        agent_memory_id: agentMemoryId,
+        persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
         configurable: {
           ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
-          thread_id: threadId
+          thread_id: threadId,
+          agent_memory_id: agentMemoryId
         },
         okf_envelope: okfEnvelope,
         metadata: {
           ...(typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {}),
           thread_id: threadId,
           session_id: threadId,
+          agent_memory_id: agentMemoryId,
+          persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
           source: "gcf-react-aaas-stream",
           runtime_boundary: "external-langgraph",
           received_at: startedAt,
@@ -313,6 +327,7 @@ exports.reactAaasStream = onRequest(
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null,
         thread_id: threadId,
+        agent_memory_id: agentMemoryId,
         input,
         messages,
         output: finalAnswer,
@@ -336,6 +351,7 @@ exports.reactAaasStream = onRequest(
         ok: true,
         run_key: runKey,
         thread_id: threadId,
+        agent_memory_id: agentMemoryId,
         okf_key: okfKey,
         agent_id: agent.agent_id || agentId || null
       });
@@ -379,6 +395,46 @@ exports.reactAaasCheckpointInspect = onRequest(
     try {
       const requestBody = typeof req.body === "object" && req.body ? req.body : {};
       const result = await inspectStandaloneLangGraphCheckpoints(runtimeUrl, requestBody);
+      res.status(200).json(result);
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message || String(error)
+      });
+    }
+  }
+);
+
+exports.reactAaasAgentMemoryInspect = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "512MiB",
+    secrets: [LANGGRAPH_RUNTIME_TOKEN]
+  },
+  async (req, res) => {
+    setCors(res);
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+      return;
+    }
+
+    const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
+    if (!runtimeUrl) {
+      res.status(503).json({ ok: false, error: "LANGGRAPH_RUNTIME_URL_REQUIRED" });
+      return;
+    }
+
+    try {
+      const requestBody = typeof req.body === "object" && req.body ? req.body : {};
+      const result = await inspectStandaloneLangGraphAgentMemory(runtimeUrl, requestBody);
       res.status(200).json(result);
     } catch (error) {
       res.status(500).json({
@@ -1452,6 +1508,25 @@ async function inspectStandaloneLangGraphCheckpoints(runtimeUrl, payload) {
   return body;
 }
 
+async function inspectStandaloneLangGraphAgentMemory(runtimeUrl, payload) {
+  const token = String(LANGGRAPH_RUNTIME_TOKEN.value() || "");
+  const baseUrl = runtimeUrl.replace(/\/invoke$/i, "");
+  const inspectUrl = `${baseUrl}/agent-memory/inspect`;
+  const response = await fetch(inspectUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) {
+    throw new Error(`External agent memory inspection failed: ${body.error || response.statusText}`);
+  }
+  return body;
+}
+
 function parseSseBlock(block) {
   const lines = String(block || "").split(/\r?\n/);
   let event = "message";
@@ -1720,6 +1795,26 @@ function extractThreadId(requestBody, agentId, okfKey) {
   const normalized = normalizeThreadId(raw);
   if (normalized) return normalized;
   return `crudx_${compactIdPart(agentId || "agent")}_${compactIdPart(okfKey || "okf")}`;
+}
+
+function extractAgentMemoryId(requestBody, agentId, okfKey) {
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  const raw = requestBody.agent_memory_id
+    || requestBody.agentMemoryId
+    || configurable.agent_memory_id
+    || configurable.agentMemoryId
+    || metadata.agent_memory_id
+    || metadata.agentMemoryId;
+  return normalizeAgentMemoryId(raw || `agent_global_${agentId || okfKey || "agent"}`);
+}
+
+function normalizeAgentMemoryId(value) {
+  return String(value || "agent_global_agent")
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 180) || "agent_global_agent";
 }
 
 function normalizeThreadId(value) {

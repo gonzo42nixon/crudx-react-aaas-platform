@@ -6,6 +6,7 @@ const { URL } = require("node:url");
 const { Annotation, END, START, StateGraph } = require("@langchain/langgraph");
 const { Client } = require("langsmith");
 const { RunTree } = require("langsmith/run_trees");
+const { Firestore } = require("@google-cloud/firestore");
 const { createFirestoreCheckpointer } = require("./firestore_checkpointer");
 
 const PORT = Number(process.env.PORT || 8080);
@@ -20,8 +21,10 @@ const AI_FEEDBACK_MAX_CRITICS = Number(process.env.AI_FEEDBACK_MAX_CRITICS || 3)
 const LANGGRAPH_CHECKPOINT_BACKEND = String(process.env.LANGGRAPH_CHECKPOINT_BACKEND || "firestore").toLowerCase();
 const LANGGRAPH_CHECKPOINT_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_COLLECTION || "langgraph_checkpoints";
 const LANGGRAPH_CHECKPOINT_WRITES_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_WRITES_COLLECTION || "langgraph_checkpoint_writes";
+const LANGGRAPH_AGENT_MEMORY_COLLECTION = process.env.LANGGRAPH_AGENT_MEMORY_COLLECTION || "agent_global_memory";
 
 let graphCheckpointer;
+let agentMemoryFirestore;
 
 const server = http.createServer(async (req, res) => {
   setCors(res);
@@ -60,6 +63,24 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readJsonBody(req);
       const result = await inspectCheckpoints(body);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, {
+        ok: false,
+        error: error.message || String(error)
+      });
+    }
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/agent-memory/inspect") {
+    if (RUNTIME_TOKEN && req.headers.authorization !== `Bearer ${RUNTIME_TOKEN}`) {
+      sendJson(res, 401, { ok: false, error: "UNAUTHORIZED" });
+      return;
+    }
+    try {
+      const body = await readJsonBody(req);
+      const result = await inspectAgentMemory(body);
       sendJson(res, 200, result);
     } catch (error) {
       sendJson(res, 500, {
@@ -134,8 +155,11 @@ async function invokeGraph(requestBody, options = {}) {
   const okfEnvelope = requestBody.okf_envelope || requestBody.okfEnvelope;
   const incomingMetadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
   const threadId = extractThreadId(requestBody, okfKey, runKey);
+  const agentMemoryId = extractAgentMemoryId(requestBody, okfKey);
   const metadata = {
     ...incomingMetadata,
+    agent_memory_id: agentMemoryId,
+    persistence_scope: incomingMetadata.persistence_scope || requestBody.persistence_scope || "thread_and_agent",
     thread_id: threadId,
     session_id: incomingMetadata.session_id || incomingMetadata.sessionId || threadId
   };
@@ -144,6 +168,7 @@ async function invokeGraph(requestBody, options = {}) {
     okf_key: okfKey,
     run_key: runKey,
     thread_id: threadId,
+    agent_memory_id: agentMemoryId,
     checkpoint_backend: checkpointBackend(),
     checkpoint_ns: okfKey
   }));
@@ -156,6 +181,17 @@ async function invokeGraph(requestBody, options = {}) {
   await postLangSmithRun(langsmith);
 
   try {
+    const agentMemory = await loadAgentGlobalMemory(agentMemoryId, {
+      okfKey,
+      agentId: requestBody.agent_id || requestBody.agentId || null
+    });
+    trace.push(step("langgraph_runtime", "agent_memory_loaded", {
+      ...agentMemoryInspection(agentMemoryId),
+      agent_memory_id: agentMemoryId,
+      episode_count: agentMemory.episodes.length,
+      updated_at: agentMemory.updated_at || null
+    }));
+
     const graphResult = await runExternalLangGraphExecutor({
       okfEnvelope,
       okfKey,
@@ -164,9 +200,24 @@ async function invokeGraph(requestBody, options = {}) {
       dryRun,
       threadId,
       metadata,
+      agentMemory,
       langsmith,
       trace
     });
+    const persistedAgentMemory = await persistAgentGlobalMemory(agentMemoryId, {
+      existing: agentMemory,
+      okfKey,
+      agent: graphResult.agent,
+      threadId,
+      runKey,
+      input,
+      answer: graphResult.finalAnswer,
+      action: graphResult.graphSummary.action,
+      nodes: graphResult.graphSummary.nodes
+    });
+    graphResult.graphSummary.agent_memory = summarizeAgentMemoryForGraph(persistedAgentMemory);
+    trace.push(step("langgraph_runtime", "agent_memory_persisted", graphResult.graphSummary.agent_memory));
+
     await postLangGraphSpans(langsmith, graphResult, trace);
 
     trace.push(step("langgraph_runtime", "checkpoint_inspection", graphResult.graphSummary.checkpoint_inspection));
@@ -238,6 +289,162 @@ function getGraphCheckpointer() {
     graphCheckpointer = createFirestoreCheckpointer();
   }
   return graphCheckpointer;
+}
+
+function getAgentMemoryFirestore() {
+  if (!agentMemoryFirestore) {
+    agentMemoryFirestore = new Firestore();
+  }
+  return agentMemoryFirestore;
+}
+
+function agentMemoryCollection() {
+  return getAgentMemoryFirestore().collection(LANGGRAPH_AGENT_MEMORY_COLLECTION);
+}
+
+function extractAgentMemoryId(requestBody, okfKey) {
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const explicit = requestBody.agent_memory_id
+    || requestBody.agentMemoryId
+    || configurable.agent_memory_id
+    || configurable.agentMemoryId
+    || metadata.agent_memory_id
+    || metadata.agentMemoryId;
+  const fallback = requestBody.agent_id || requestBody.agentId || okfKey || "unknown-agent";
+  return normalizeAgentMemoryId(explicit || `agent_global_${fallback}`);
+}
+
+function normalizeAgentMemoryId(value) {
+  return String(value || "agent_global_unknown")
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .slice(0, 180) || "agent_global_unknown";
+}
+
+function agentMemoryDocId(agentMemoryId) {
+  return Buffer.from(normalizeAgentMemoryId(agentMemoryId)).toString("base64url");
+}
+
+function agentMemoryInspection(agentMemoryId) {
+  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT_ID || "crudx-e0599";
+  return {
+    backend: "firestore",
+    project,
+    collection: LANGGRAPH_AGENT_MEMORY_COLLECTION,
+    document_id: agentMemoryDocId(agentMemoryId),
+    firestore_console_url: `https://console.cloud.google.com/firestore/databases/-default-/data/panel/${encodeURIComponent(LANGGRAPH_AGENT_MEMORY_COLLECTION)}?project=${encodeURIComponent(project)}`,
+    filter: {
+      agent_memory_id: agentMemoryId
+    },
+    filter_hint: `agent_memory_id == "${agentMemoryId}"`
+  };
+}
+
+async function loadAgentGlobalMemory(agentMemoryId, hints = {}) {
+  const normalized = normalizeAgentMemoryId(agentMemoryId);
+  const snapshot = await agentMemoryCollection().doc(agentMemoryDocId(normalized)).get();
+  const data = snapshot.exists ? snapshot.data() : {};
+  return normalizeAgentMemoryDocument({
+    schema: "crudx.react_aaas.agent_memory.v1",
+    agent_memory_id: normalized,
+    agent_id: data.agent_id || hints.agentId || null,
+    okf_key: data.okf_key || hints.okfKey || null,
+    memory_profile: data.memory_profile || null,
+    facts: data.facts || [],
+    episodes: data.episodes || [],
+    created_at: data.created_at || null,
+    updated_at: data.updated_at || null,
+    run_count: data.run_count || 0
+  });
+}
+
+async function persistAgentGlobalMemory(agentMemoryId, detail) {
+  const now = new Date().toISOString();
+  const existing = normalizeAgentMemoryDocument(detail.existing || { agent_memory_id: agentMemoryId });
+  const agent = detail.agent || {};
+  const episode = {
+    at: now,
+    run_key: detail.runKey || null,
+    thread_id: detail.threadId || null,
+    okf_key: detail.okfKey || existing.okf_key || null,
+    agent_id: agent.agent_id || existing.agent_id || null,
+    action: detail.action || "none",
+    input: previewText(detail.input || "", 900),
+    answer: previewText(detail.answer || "", 1200),
+    nodes: Array.isArray(detail.nodes) ? detail.nodes.slice(-20) : []
+  };
+  const next = normalizeAgentMemoryDocument({
+    ...existing,
+    agent_memory_id: normalizeAgentMemoryId(agentMemoryId),
+    agent_id: agent.agent_id || existing.agent_id || null,
+    okf_key: detail.okfKey || existing.okf_key || null,
+    memory_profile: agentMemoryProfile(agent) || existing.memory_profile || null,
+    episodes: [episode, ...existing.episodes].slice(0, 20),
+    run_count: Number(existing.run_count || 0) + 1,
+    created_at: existing.created_at || now,
+    updated_at: now
+  });
+  await agentMemoryCollection().doc(agentMemoryDocId(next.agent_memory_id)).set(next, { merge: true });
+  return next;
+}
+
+function normalizeAgentMemoryDocument(value) {
+  const source = typeof value === "object" && value ? value : {};
+  return {
+    schema: "crudx.react_aaas.agent_memory.v1",
+    agent_memory_id: normalizeAgentMemoryId(source.agent_memory_id),
+    agent_id: source.agent_id || null,
+    okf_key: source.okf_key || null,
+    memory_profile: source.memory_profile || null,
+    facts: Array.isArray(source.facts) ? source.facts.slice(0, 50).map((item) => previewText(item, 700)) : [],
+    episodes: Array.isArray(source.episodes)
+      ? source.episodes.slice(0, 20).map((item) => ({
+        at: item?.at || null,
+        run_key: item?.run_key || null,
+        thread_id: item?.thread_id || null,
+        okf_key: item?.okf_key || null,
+        agent_id: item?.agent_id || null,
+        action: item?.action || "none",
+        input: previewText(item?.input || "", 900),
+        answer: previewText(item?.answer || "", 1200),
+        nodes: Array.isArray(item?.nodes) ? item.nodes.slice(-20) : []
+      }))
+      : [],
+    created_at: source.created_at || null,
+    updated_at: source.updated_at || null,
+    run_count: Number(source.run_count || 0)
+  };
+}
+
+function summarizeAgentMemoryForGraph(memory) {
+  const normalized = normalizeAgentMemoryDocument(memory);
+  return {
+    ...agentMemoryInspection(normalized.agent_memory_id),
+    agent_memory_id: normalized.agent_memory_id,
+    agent_id: normalized.agent_id,
+    okf_key: normalized.okf_key,
+    memory_profile: normalized.memory_profile,
+    run_count: normalized.run_count,
+    episode_count: normalized.episodes.length,
+    latest_episode_at: normalized.episodes[0]?.at || null,
+    updated_at: normalized.updated_at
+  };
+}
+
+async function inspectAgentMemory(requestBody) {
+  const agentMemoryId = extractAgentMemoryId(requestBody, requestBody.okf_key || requestBody.okfKey || "");
+  const memory = await loadAgentGlobalMemory(agentMemoryId, {
+    okfKey: requestBody.okf_key || requestBody.okfKey || null,
+    agentId: requestBody.agent_id || requestBody.agentId || null
+  });
+  return {
+    ok: true,
+    inspection_generated_at: new Date().toISOString(),
+    ...summarizeAgentMemoryForGraph(memory),
+    memory,
+    note: "Agent memory is shared across threads for the same agent_memory_id. LangGraph checkpoints remain thread-local."
+  };
 }
 
 function checkpointInspection(threadId, checkpointNs) {
@@ -402,6 +609,10 @@ function createExternalLangGraph() {
       reducer: (_left, right) => right,
       default: () => ({})
     }),
+    agentMemory: Annotation({
+      reducer: (_left, right) => right,
+      default: () => null
+    }),
     agent: Annotation(),
     plan: Annotation(),
     action: Annotation(),
@@ -458,10 +669,11 @@ function createExternalLangGraph() {
         {
           input: state.input,
           history_messages: state.messages.length,
-          knowledge_chars: String(state.agent.knowledge || "").length
+          knowledge_chars: String(state.agent.knowledge || "").length,
+          agent_memory_episodes: Array.isArray(state.agentMemory?.episodes) ? state.agentMemory.episodes.length : 0
         },
         { graph_node: "context_review", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ contextReview: buildContextReview(state.input, state.messages, state.agent) }),
+        async () => ({ contextReview: buildContextReview(state.input, state.messages, state.agent, state.agentMemory) }),
         (result) => result
       );
       trace?.push(step("langgraph", "node_context_review", {
@@ -799,7 +1011,7 @@ function createExternalLangGraph() {
   return checkpointer ? graphBuilder.compile({ checkpointer }) : graphBuilder.compile();
 }
 
-async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, threadId, metadata, langsmith, trace }) {
+async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, threadId, metadata, agentMemory, langsmith, trace }) {
   const graph = createExternalLangGraph();
   const checkpointNs = okfKey;
   const checkpoint_backend = checkpointBackend();
@@ -808,10 +1020,10 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
     langsmith,
     "LangGraph Executor: external CRUDX OKF ReAct Graph",
     "chain",
-    { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId, checkpoint_backend },
-    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_backend, runtime_boundary: "external" },
+    { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId, checkpoint_backend, agent_memory_id: agentMemory?.agent_memory_id || null },
+    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_backend, agent_memory_id: agentMemory?.agent_memory_id || null, runtime_boundary: "external" },
     () => graph.invoke(
-      { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {} },
+      { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {}, agentMemory: agentMemory || null },
       { configurable: { thread_id: threadId, checkpoint_ns: checkpointNs, dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
     ),
     (state) => ({
@@ -833,6 +1045,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
       checkpoint_backend,
       checkpoint_ns: checkpointNs,
       checkpoint_inspection,
+      agent_memory: agentMemory ? summarizeAgentMemoryForGraph(agentMemory) : null,
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
@@ -1011,13 +1224,15 @@ function selectGraphTool(input, agent) {
   return tools[0];
 }
 
-function buildContextReview(input, messages, agent) {
+function buildContextReview(input, messages, agent, agentMemory = null) {
   const memory = buildConversationMemory(messages, agent);
+  const globalMemory = buildAgentGlobalMemoryReview(agentMemory);
   if (isPeanoAgent(agent)) {
     return [
       "The current turn concerns Peano arithmetic.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
       memory,
+      globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local Peano knowledge.`,
       "The executor should invoke the Peano addition tool for addition requests and preserve the OKF JSON output contract."
     ].join(" ");
@@ -1027,6 +1242,7 @@ function buildContextReview(input, messages, agent) {
       "The current turn concerns requestor location estimation.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
       memory,
+      globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of privacy/location knowledge.`,
       "The executor should invoke the requestor location tool and clearly distinguish explicit, header-derived, and weak browser-context evidence."
     ].join(" ");
@@ -1036,6 +1252,7 @@ function buildContextReview(input, messages, agent) {
       "The current turn concerns academic research assistance.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
       memory,
+      globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local research knowledge.`,
       "The executor should ground claims in the research tool and separate known facts, inferred context, missing evidence, and next research steps."
     ].join(" ");
@@ -1045,6 +1262,7 @@ function buildContextReview(input, messages, agent) {
       "The current turn concerns infrastructure incident triage.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
       memory,
+      globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of infrastructure knowledge.`,
       "The executor should compare confirmed host status, state the most suspicious component, separate assumptions from evidence, and produce operational next steps or handoff notes when requested."
     ].join(" ");
@@ -1060,8 +1278,26 @@ function buildContextReview(input, messages, agent) {
     `The current turn concerns ${topics.join(", ")}.`,
     `Prior conversation turns available: ${history.length}.`,
     memory,
+    globalMemory,
     `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local knowledge.`,
     "The executor should avoid a premature final answer and use only tools that are configured in the active OKF and relevant to the current request."
+  ].join(" ");
+}
+
+function buildAgentGlobalMemoryReview(agentMemory) {
+  const memory = normalizeAgentMemoryDocument(agentMemory || {});
+  if (!memory.episodes.length) {
+    return "Agent-global memory: no prior persisted episodes for this agent_memory_id.";
+  }
+  const episodes = memory.episodes.slice(0, 5).map((episode, index) => {
+    const input = previewText(episode.input || "", 180);
+    const answer = previewText(episode.answer || "", 220);
+    return `${index + 1}. ${episode.at || "unknown time"} action=${episode.action || "none"} input="${input}" answer="${answer}"`;
+  });
+  return [
+    `Agent-global memory: ${memory.episodes.length} persisted episodes for ${memory.agent_memory_id}.`,
+    "Use this memory only when it is relevant to the current user request and do not confuse it with thread-local conversation turns.",
+    ...episodes
   ].join(" ");
 }
 

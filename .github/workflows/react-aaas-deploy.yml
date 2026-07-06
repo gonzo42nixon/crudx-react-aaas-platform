@@ -96,7 +96,7 @@ jobs:
 
       - name: Deploy GCF middleware
         working-directory: gcf-middleware
-        run: npx firebase-tools deploy --only functions:react-aaas:reactAaasInvoke,functions:react-aaas:reactAaasStream,functions:react-aaas:reactAaasCheckpointInspect --project "$GCP_PROJECT_ID" --non-interactive
+        run: npx firebase-tools deploy --only functions:react-aaas:reactAaasInvoke,functions:react-aaas:reactAaasStream,functions:react-aaas:reactAaasCheckpointInspect,functions:react-aaas:reactAaasAgentMemoryInspect --project "$GCP_PROJECT_ID" --non-interactive
 
       - name: Smoke test health endpoint
         run: curl --fail --silent "$CLOUD_RUN_URL/health"
