@@ -66,6 +66,7 @@ exports.reactAaasInvoke = onRequest(
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
     const threadId = extractThreadId(requestBody, agentId, okfKey);
     const agentMemoryId = extractAgentMemoryId(requestBody, agentId, okfKey);
+    const openApiKey = extractOpenApiKey(requestBody);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -107,11 +108,13 @@ exports.reactAaasInvoke = onRequest(
         thread_id: threadId,
         session_id: threadId,
         agent_memory_id: agentMemoryId,
+        openapi_key: openApiKey,
         persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
         configurable: {
           ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
           thread_id: threadId,
-          agent_memory_id: agentMemoryId
+          agent_memory_id: agentMemoryId,
+          openapi_key: openApiKey
         },
         okf_envelope: okfEnvelope,
         metadata: {
@@ -119,6 +122,7 @@ exports.reactAaasInvoke = onRequest(
           thread_id: threadId,
           session_id: threadId,
           agent_memory_id: agentMemoryId,
+          openapi_key: openApiKey,
           persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
           source: "gcf-react-aaas-middleware",
           runtime_boundary: "external-langgraph",
@@ -249,6 +253,7 @@ exports.reactAaasStream = onRequest(
     const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
     const threadId = extractThreadId(requestBody, agentId, okfKey);
     const agentMemoryId = extractAgentMemoryId(requestBody, agentId, okfKey);
+    const openApiKey = extractOpenApiKey(requestBody);
 
     if (!input) {
       res.status(400).json({ ok: false, error: "INPUT_REQUIRED" });
@@ -286,11 +291,13 @@ exports.reactAaasStream = onRequest(
         thread_id: threadId,
         session_id: threadId,
         agent_memory_id: agentMemoryId,
+        openapi_key: openApiKey,
         persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
         configurable: {
           ...(typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {}),
           thread_id: threadId,
-          agent_memory_id: agentMemoryId
+          agent_memory_id: agentMemoryId,
+          openapi_key: openApiKey
         },
         okf_envelope: okfEnvelope,
         metadata: {
@@ -298,6 +305,7 @@ exports.reactAaasStream = onRequest(
           thread_id: threadId,
           session_id: threadId,
           agent_memory_id: agentMemoryId,
+          openapi_key: openApiKey,
           persistence_scope: requestBody.persistence_scope || requestBody.persistenceScope || "thread_and_agent",
           source: "gcf-react-aaas-stream",
           runtime_boundary: "external-langgraph",
@@ -1807,6 +1815,23 @@ function extractAgentMemoryId(requestBody, agentId, okfKey) {
     || metadata.agent_memory_id
     || metadata.agentMemoryId;
   return normalizeAgentMemoryId(raw || `agent_global_${agentId || okfKey || "agent"}`);
+}
+
+function extractOpenApiKey(requestBody) {
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  return String(
+    requestBody.openapi_key
+    || requestBody.openApiKey
+    || requestBody.openapiKey
+    || configurable.openapi_key
+    || configurable.openApiKey
+    || configurable.openapiKey
+    || metadata.openapi_key
+    || metadata.openApiKey
+    || metadata.openapiKey
+    || ""
+  ).trim();
 }
 
 function normalizeAgentMemoryId(value) {

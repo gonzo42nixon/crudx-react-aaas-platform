@@ -159,6 +159,7 @@ async function invokeGraph(requestBody, options = {}) {
   const metadata = {
     ...incomingMetadata,
     agent_memory_id: agentMemoryId,
+    openapi_key: extractOpenApiKey(requestBody),
     persistence_scope: incomingMetadata.persistence_scope || requestBody.persistence_scope || "thread_and_agent",
     thread_id: threadId,
     session_id: incomingMetadata.session_id || incomingMetadata.sessionId || threadId
@@ -313,6 +314,23 @@ function extractAgentMemoryId(requestBody, okfKey) {
     || metadata.agentMemoryId;
   const fallback = requestBody.agent_id || requestBody.agentId || okfKey || "unknown-agent";
   return normalizeAgentMemoryId(explicit || `agent_global_${fallback}`);
+}
+
+function extractOpenApiKey(requestBody) {
+  const configurable = typeof requestBody.configurable === "object" && requestBody.configurable ? requestBody.configurable : {};
+  const metadata = typeof requestBody.metadata === "object" && requestBody.metadata ? requestBody.metadata : {};
+  return String(
+    requestBody.openapi_key
+    || requestBody.openApiKey
+    || requestBody.openapiKey
+    || configurable.openapi_key
+    || configurable.openApiKey
+    || configurable.openapiKey
+    || metadata.openapi_key
+    || metadata.openApiKey
+    || metadata.openapiKey
+    || ""
+  ).trim();
 }
 
 function normalizeAgentMemoryId(value) {
@@ -673,7 +691,7 @@ function createExternalLangGraph() {
           agent_memory_episodes: Array.isArray(state.agentMemory?.episodes) ? state.agentMemory.episodes.length : 0
         },
         { graph_node: "context_review", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ contextReview: buildContextReview(state.input, state.messages, state.agent, state.agentMemory) }),
+        async () => ({ contextReview: buildContextReview(state.input, state.messages, state.agent, state.agentMemory, state.metadata) }),
         (result) => result
       );
       trace?.push(step("langgraph", "node_context_review", {
@@ -1188,6 +1206,7 @@ function buildConversationMemory(messages, agent) {
 }
 
 function selectGraphTool(input, agent) {
+  if (isAgentSelfQuestion(input)) return null;
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   if (!tools.length) return null;
   const text = String(input || "").toLowerCase();
@@ -1224,13 +1243,15 @@ function selectGraphTool(input, agent) {
   return tools[0];
 }
 
-function buildContextReview(input, messages, agent, agentMemory = null) {
+function buildContextReview(input, messages, agent, agentMemory = null, metadata = {}) {
   const memory = buildConversationMemory(messages, agent);
   const globalMemory = buildAgentGlobalMemoryReview(agentMemory);
+  const selfContext = buildAgentSelfContext(agent, agentMemory, metadata);
   if (isPeanoAgent(agent)) {
     return [
       "The current turn concerns Peano arithmetic.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      selfContext,
       memory,
       globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local Peano knowledge.`,
@@ -1241,6 +1262,7 @@ function buildContextReview(input, messages, agent, agentMemory = null) {
     return [
       "The current turn concerns requestor location estimation.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      selfContext,
       memory,
       globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of privacy/location knowledge.`,
@@ -1251,6 +1273,7 @@ function buildContextReview(input, messages, agent, agentMemory = null) {
     return [
       "The current turn concerns academic research assistance.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      selfContext,
       memory,
       globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local research knowledge.`,
@@ -1261,6 +1284,7 @@ function buildContextReview(input, messages, agent, agentMemory = null) {
     return [
       "The current turn concerns infrastructure incident triage.",
       `Prior conversation turns available: ${(Array.isArray(messages) ? messages : []).length}.`,
+      selfContext,
       memory,
       globalMemory,
       `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of infrastructure knowledge.`,
@@ -1277,6 +1301,7 @@ function buildContextReview(input, messages, agent, agentMemory = null) {
   return [
     `The current turn concerns ${topics.join(", ")}.`,
     `Prior conversation turns available: ${history.length}.`,
+    selfContext,
     memory,
     globalMemory,
     `The active OKF exposes ${agent.okf.allowed_tools.length} configured tools and ${String(agent.knowledge || "").length} characters of local knowledge.`,
@@ -1299,6 +1324,43 @@ function buildAgentGlobalMemoryReview(agentMemory) {
     "Use this memory only when it is relevant to the current user request and do not confuse it with thread-local conversation turns.",
     ...episodes
   ].join(" ");
+}
+
+function buildAgentSelfContext(agent, agentMemory = null, metadata = {}) {
+  const memory = normalizeAgentMemoryDocument(agentMemory || {});
+  const meta = agent?.meta || {};
+  const okfKey = memory.okf_key || metadata.okf_key || metadata.okfKey || meta.okf_key || meta.crudx_key || agent?.okf_key || "";
+  const openApiKey = String(metadata.openapi_key || metadata.openApiKey || metadata.openapiKey || meta.openapi_key || meta.openapiKey || meta.openapi_spec_key || "").trim();
+  const creator = meta.created_by || meta.creator || meta.author || meta.owner || meta.maintainer || "";
+  const episodes = memory.episodes || [];
+  const actionCounts = new Map();
+  for (const episode of episodes) {
+    const action = episode.action || "none";
+    actionCounts.set(action, (actionCounts.get(action) || 0) + 1);
+  }
+  const frequentActions = Array.from(actionCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([action, count]) => `${action} (${count})`);
+  return [
+    "Agent self model:",
+    `agent_id=${agent?.agent_id || "unknown"}.`,
+    `name=${meta.name || agent?.agent_id || "unknown"}.`,
+    `constituting_okf_key=${okfKey || "unknown"}.`,
+    `openapi_key=${openApiKey || "unknown"}.`,
+    `agent_memory_id=${memory.agent_memory_id || "unknown"}.`,
+    `persisted_episode_count=${episodes.length}.`,
+    `run_count=${memory.run_count || 0}.`,
+    frequentActions.length ? `frequent_actions=${frequentActions.join(", ")}.` : "frequent_actions=none yet.",
+    creator ? `configured_by=${creator}.` : "configured_by=not specified in the OKF metadata.",
+    "For questions about your basis, answer from the constituting OKF and its CRUDX key.",
+    "For questions about how to use you, answer from the OpenAPI artifact key and configured tools/endpoints when available.",
+    "For questions about what you learned or how to inspect your memory, mention the agent_memory_id and that the platform exposes an Agent Memory inspection pill after runs."
+  ].join(" ");
+}
+
+function isAgentSelfQuestion(input) {
+  return /(\bwho\s+(made|created|configured)\s+you\b|\bwhat\s+is\s+your\s+(basis|foundation|memory|id)\b|\bhow\s+can\s+i\s+use\s+you\b|\bwhat\s+have\s+you\s+learned\b|\bhow\s+often\s+have\s+you\s+been\s+used\b|\bmost\s+frequent\b|wer\s+hat\s+dich\s+(gemacht|erstellt|konfiguriert)|was\s+ist\s+deine\s+(grundlage|basis|memory|id)|wie\s+kann\s+ich\s+dich\s+(benutzen|verwenden)|was\s+hast\s+du\s+gelernt|wie\s+h[aä]ufig\s+wurdest\s+du\s+benutzt|was\s+fragt\s+man\s+dich\s+am\s+h[aä]ufigsten|agent[-\s]?memory|ged[aä]chtnis|openapi|okf)/i.test(String(input || ""));
 }
 
 async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata = {}) {
@@ -1728,7 +1790,8 @@ function buildAgentSynthesis(state) {
 }
 
 function buildGraphFinalPrompt(state) {
-  const requiresJson = agentRequiresJsonOutput(state.agent);
+  const selfQuestion = isAgentSelfQuestion(state.input);
+  const requiresJson = agentRequiresJsonOutput(state.agent) && !selfQuestion;
   const academicRequirements = isAcademicAgent(state.agent)
     ? [
         "",
@@ -1765,6 +1828,9 @@ function buildGraphFinalPrompt(state) {
       ].join("\n")
     : "";
   return [
+    selfQuestion
+      ? "The current user input is an agent self-knowledge question. Answer from the Agent self model in normal prose, even if the domain OKF usually requires JSON."
+      : "",
     state.agent.okf.system_prompt,
     academicRequirements,
     opsRequirements,
@@ -1802,12 +1868,17 @@ function buildGraphFinalPrompt(state) {
     "Conversation memory summary:",
     buildConversationMemory(state.messages || [], state.agent),
     "",
+    "Agent self model:",
+    buildAgentSelfContext(state.agent, state.agentMemory, state.metadata),
+    "",
     `Current user input: ${state.input}`,
     "",
     "Final response requirements:",
     "- Use prior conversation when relevant.",
     "- Separate known facts from missing information.",
-    "- Do not mention OKF, OKF context, active OKF, graph state, or platform internals in normal user-facing answers.",
+    selfQuestion
+      ? "- This is a self-knowledge question. You may mention OKF, OpenAPI, CRUDX IDs, episode counts, run counts, and Agent Memory inspection in plain user-facing language."
+      : "- Do not mention OKF, OKF context, active OKF, graph state, or platform internals in normal user-facing answers.",
     "- When you need to identify the source of a fact, use ordinary language such as 'according to the information available', 'our records show', or 'based on the information provided'.",
     "- LangSmith tracing is handled automatically by the platform. If the user asks for a trace, acknowledge that trace metadata is attached by the platform; do not claim you cannot create traces.",
     requiresJson ? "- Return only the JSON object required by the OKF." : "- Keep the final answer short, practical, and readable.",
@@ -1816,7 +1887,7 @@ function buildGraphFinalPrompt(state) {
 }
 
 function buildGraphRevisionPrompt(state) {
-  const requiresJson = agentRequiresJsonOutput(state.agent);
+  const requiresJson = agentRequiresJsonOutput(state.agent) && !isAgentSelfQuestion(state.input);
   return [
     state.agent.okf.system_prompt,
     "",
@@ -2103,7 +2174,7 @@ function summarizeCriticFeedbackForTrace(feedback) {
 function normalizeGraphFinalAnswer(text, state) {
   const raw = String(text || "").trim();
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  if (agentRequiresJsonOutput(state.agent)) {
+  if (agentRequiresJsonOutput(state.agent) && !isAgentSelfQuestion(state.input)) {
     if (looksLikeJson(withoutFences)) return normalizeContractJson(withoutFences, state);
     const fromRaw = extractJsonObjectFromText(withoutFences);
     if (fromRaw) return normalizeContractJson(fromRaw, state);
@@ -2117,11 +2188,40 @@ function normalizeGraphFinalAnswer(text, state) {
     || /(?:\band stating|\band explain|\band recommend|\bwith|,\s*)$/i.test(withoutFences);
   const looksDebuggy = /(^|\n)\s*(Plan|Dialogue|Evidence|Final)\s*:/i.test(withoutFences)
     || /LangGraph Node|Graph state|tool_observation|agent_reflection/i.test(withoutFences);
+  if (isAgentSelfQuestion(state.input) && (looksLikeJson(withoutFences) || looksIncomplete || looksDebuggy)) {
+    return buildAgentSelfAnswer(state);
+  }
   if (isLocationAgent(state.agent) && /https:\/\/www\.google\.com\/maps\/dir\//i.test([state.observation, state.synthesis].join("\n")) && !/https:\/\/www\.google\.com\/maps\/dir\//i.test(withoutFences)) {
     return buildDeterministicGraphSections(state);
   }
   const answer = looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
+  if (isAgentSelfQuestion(state.input)) return answer;
   return humanizeUserFacingPlatformLanguage(answer);
+}
+
+function buildAgentSelfAnswer(state) {
+  const memory = normalizeAgentMemoryDocument(state.agentMemory || {});
+  const metadata = state.metadata || {};
+  const meta = state.agent?.meta || {};
+  const name = meta.name || state.agent?.agent_id || "dieser Agent";
+  const okfKey = memory.okf_key || metadata.okf_key || metadata.okfKey || "-";
+  const openApiKey = metadata.openapi_key || metadata.openApiKey || metadata.openapiKey || meta.openapi_key || "-";
+  const memoryId = memory.agent_memory_id || metadata.agent_memory_id || "-";
+  const text = String(state.input || "");
+  if (/benutzen|verwenden|use|openapi/i.test(text)) {
+    return `Du kannst mich über mein OpenAPI-Artefakt ${openApiKey} benutzen. Meine fachliche Grundlage ist das OKF ${okfKey}; in dieser Umgebung kannst du mir direkt Fragen stellen oder die OpenAPI-App öffnen, um meine Operationen und Testaufrufe zu sehen.`;
+  }
+  if (/gelernt|memory|ged[aä]chtnis|inspect|inspizieren/i.test(text)) {
+    return `Mein Agenten-Gedächtnis hat die ID ${memoryId}. Es enthält aktuell ${memory.episodes.length} persistierte Episode(n) aus ${memory.run_count || memory.episodes.length} Lauf/Läufen und kann nach einem Lauf über die Agent-Memory-Pill inspiziert werden.`;
+  }
+  if (/h[aä]ufig|often|frequent|meist/i.test(text)) {
+    const counts = new Map();
+    for (const episode of memory.episodes || []) counts.set(episode.action || "none", (counts.get(episode.action || "none") || 0) + 1);
+    const top = Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0];
+    return `Ich wurde in diesem agent-globalen Gedächtnis bisher ${memory.run_count || memory.episodes.length} Mal persistiert. Am häufigsten sehe ich aktuell ${top ? `${top[0]} (${top[1]} Mal)` : "noch kein wiederkehrendes Muster"}.`;
+  }
+  const creator = meta.created_by || meta.creator || meta.author || meta.owner || meta.maintainer || "";
+  return `Ich bin ${name}. Meine Grundlage ist mein konstituierendes OKF ${okfKey}; darüber sind Rolle, Werkzeuge, Wissen und Antwortregeln definiert. ${creator ? `Konfiguriert wurde ich von ${creator}. ` : "Ein konkreter Ersteller ist in meinen OKF-Metadaten nicht angegeben. "}Mein OpenAPI-Artefakt ist ${openApiKey}, und mein Agenten-Gedächtnis hat die ID ${memoryId}.`;
 }
 
 function humanizeUserFacingPlatformLanguage(value) {
