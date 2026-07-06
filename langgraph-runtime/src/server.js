@@ -18,6 +18,8 @@ const AI_FEEDBACK_ENABLED = process.env.AI_FEEDBACK_ENABLED !== "false";
 const AI_FEEDBACK_TIMEOUT_MS = Number(process.env.AI_FEEDBACK_TIMEOUT_MS || 12000);
 const AI_FEEDBACK_MAX_CRITICS = Number(process.env.AI_FEEDBACK_MAX_CRITICS || 3);
 const LANGGRAPH_CHECKPOINT_BACKEND = String(process.env.LANGGRAPH_CHECKPOINT_BACKEND || "firestore").toLowerCase();
+const LANGGRAPH_CHECKPOINT_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_COLLECTION || "langgraph_checkpoints";
+const LANGGRAPH_CHECKPOINT_WRITES_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_WRITES_COLLECTION || "langgraph_checkpoint_writes";
 
 let graphCheckpointer;
 
@@ -149,6 +151,8 @@ async function invokeGraph(requestBody, options = {}) {
     });
     await postLangGraphSpans(langsmith, graphResult, trace);
 
+    trace.push(step("langgraph_runtime", "checkpoint_inspection", graphResult.graphSummary.checkpoint_inspection));
+
     await endLangSmithRun(langsmith, {
       ok: true,
       run_key: runKey,
@@ -216,6 +220,28 @@ function getGraphCheckpointer() {
     graphCheckpointer = createFirestoreCheckpointer();
   }
   return graphCheckpointer;
+}
+
+function checkpointInspection(threadId, checkpointNs) {
+  if (checkpointBackend() !== "firestore") {
+    return {
+      backend: "none"
+    };
+  }
+  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || process.env.GCP_PROJECT_ID || "crudx-e0599";
+  const firestoreConsoleUrl = `https://console.cloud.google.com/firestore/databases/-default-/data/panel/${encodeURIComponent(LANGGRAPH_CHECKPOINT_COLLECTION)}?project=${encodeURIComponent(project)}`;
+  return {
+    backend: "firestore",
+    project,
+    checkpoint_collection: LANGGRAPH_CHECKPOINT_COLLECTION,
+    writes_collection: LANGGRAPH_CHECKPOINT_WRITES_COLLECTION,
+    firestore_console_url: firestoreConsoleUrl,
+    filter: {
+      thread_id: threadId,
+      checkpoint_ns: checkpointNs
+    },
+    filter_hint: `thread_id == "${threadId}" AND checkpoint_ns == "${checkpointNs}"`
+  };
 }
 
 function createExternalLangGraph() {
@@ -633,6 +659,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
   const graph = createExternalLangGraph();
   const checkpointNs = okfKey;
   const checkpoint_backend = checkpointBackend();
+  const checkpoint_inspection = checkpointInspection(threadId, checkpointNs);
   const result = await withLangSmithChild(
     langsmith,
     "LangGraph Executor: external CRUDX OKF ReAct Graph",
@@ -661,6 +688,7 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
       thread_id: threadId,
       checkpoint_backend,
       checkpoint_ns: checkpointNs,
+      checkpoint_inspection,
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
