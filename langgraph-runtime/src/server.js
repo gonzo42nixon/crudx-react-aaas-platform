@@ -6,6 +6,7 @@ const { URL } = require("node:url");
 const { Annotation, END, START, StateGraph } = require("@langchain/langgraph");
 const { Client } = require("langsmith");
 const { RunTree } = require("langsmith/run_trees");
+const { createFirestoreCheckpointer } = require("./firestore_checkpointer");
 
 const PORT = Number(process.env.PORT || 8080);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
@@ -16,6 +17,9 @@ const RUNTIME_TOKEN = process.env.LANGGRAPH_RUNTIME_TOKEN || "";
 const AI_FEEDBACK_ENABLED = process.env.AI_FEEDBACK_ENABLED !== "false";
 const AI_FEEDBACK_TIMEOUT_MS = Number(process.env.AI_FEEDBACK_TIMEOUT_MS || 12000);
 const AI_FEEDBACK_MAX_CRITICS = Number(process.env.AI_FEEDBACK_MAX_CRITICS || 3);
+const LANGGRAPH_CHECKPOINT_BACKEND = String(process.env.LANGGRAPH_CHECKPOINT_BACKEND || "firestore").toLowerCase();
+
+let graphCheckpointer;
 
 const server = http.createServer(async (req, res) => {
   setCors(res);
@@ -116,7 +120,13 @@ async function invokeGraph(requestBody, options = {}) {
     session_id: incomingMetadata.session_id || incomingMetadata.sessionId || threadId
   };
   const trace = createTraceCollector(options.onTrace);
-  trace.push(step("langgraph_runtime", "invoke_received", { okf_key: okfKey, run_key: runKey, thread_id: threadId }));
+  trace.push(step("langgraph_runtime", "invoke_received", {
+    okf_key: okfKey,
+    run_key: runKey,
+    thread_id: threadId,
+    checkpoint_backend: checkpointBackend(),
+    checkpoint_ns: okfKey
+  }));
 
   if (!input) throw new Error("INPUT_REQUIRED");
   if (!okfEnvelope) throw new Error("OKF_ENVELOPE_REQUIRED");
@@ -196,6 +206,18 @@ function createTraceCollector(onTrace) {
   return trace;
 }
 
+function checkpointBackend() {
+  return LANGGRAPH_CHECKPOINT_BACKEND === "firestore" ? "firestore" : "none";
+}
+
+function getGraphCheckpointer() {
+  if (checkpointBackend() !== "firestore") return undefined;
+  if (!graphCheckpointer) {
+    graphCheckpointer = createFirestoreCheckpointer();
+  }
+  return graphCheckpointer;
+}
+
 function createExternalLangGraph() {
   const GraphState = Annotation.Root({
     okfEnvelope: Annotation(),
@@ -234,7 +256,7 @@ function createExternalLangGraph() {
     })
   });
 
-  return new StateGraph(GraphState)
+  const graphBuilder = new StateGraph(GraphState)
     .addNode("load_okf", async (state, config) => {
       const { langsmith, trace } = config.configurable || {};
       const okfEnvelope = await withLangSmithChild(
@@ -601,21 +623,25 @@ function createExternalLangGraph() {
     .addEdge("agent_synthesis", "agent_draft")
     .addEdge("agent_draft", "critic_feedback")
     .addEdge("critic_feedback", "agent_final")
-    .addEdge("agent_final", END)
-    .compile();
+    .addEdge("agent_final", END);
+
+  const checkpointer = getGraphCheckpointer();
+  return checkpointer ? graphBuilder.compile({ checkpointer }) : graphBuilder.compile();
 }
 
 async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messages, dryRun, threadId, metadata, langsmith, trace }) {
   const graph = createExternalLangGraph();
+  const checkpointNs = okfKey;
+  const checkpoint_backend = checkpointBackend();
   const result = await withLangSmithChild(
     langsmith,
     "LangGraph Executor: external CRUDX OKF ReAct Graph",
     "chain",
-    { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId },
-    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, runtime_boundary: "external" },
+    { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId, checkpoint_backend },
+    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_backend, runtime_boundary: "external" },
     () => graph.invoke(
       { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {} },
-      { configurable: { thread_id: threadId, dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
+      { configurable: { thread_id: threadId, checkpoint_ns: checkpointNs, dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
     ),
     (state) => ({
       agent_id: state.agent?.agent_id || null,
@@ -633,6 +659,8 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
       runtime: "external-langgraph-js",
       graph: "crudx_okf_react_discourse",
       thread_id: threadId,
+      checkpoint_backend,
+      checkpoint_ns: checkpointNs,
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
