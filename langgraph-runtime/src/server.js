@@ -52,6 +52,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/checkpoints/inspect") {
+    if (RUNTIME_TOKEN && req.headers.authorization !== `Bearer ${RUNTIME_TOKEN}`) {
+      sendJson(res, 401, { ok: false, error: "UNAUTHORIZED" });
+      return;
+    }
+    try {
+      const body = await readJsonBody(req);
+      const result = await inspectCheckpoints(body);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, {
+        ok: false,
+        error: error.message || String(error)
+      });
+    }
+    return;
+  }
+
   if (req.method !== "POST" || url.pathname !== "/invoke") {
     sendJson(res, 404, { ok: false, error: "NOT_FOUND" });
     return;
@@ -242,6 +260,119 @@ function checkpointInspection(threadId, checkpointNs) {
     },
     filter_hint: `thread_id == "${threadId}" AND checkpoint_ns == "${checkpointNs}"`
   };
+}
+
+async function inspectCheckpoints(requestBody) {
+  if (checkpointBackend() !== "firestore") {
+    return { ok: false, error: "CHECKPOINT_BACKEND_NOT_ENABLED", checkpoint_backend: checkpointBackend() };
+  }
+  const threadId = String(requestBody.thread_id || requestBody.threadId || "").trim();
+  const checkpointNs = String(requestBody.checkpoint_ns || requestBody.checkpointNs || requestBody.okf_key || requestBody.okfKey || "").trim();
+  const checkpointId = String(requestBody.checkpoint_id || requestBody.checkpointId || "").trim();
+  const limit = Math.max(1, Math.min(20, Number(requestBody.limit || 8)));
+  if (!threadId) throw new Error("THREAD_ID_REQUIRED");
+  if (!checkpointNs) throw new Error("CHECKPOINT_NS_REQUIRED");
+
+  const checkpointer = getGraphCheckpointer();
+  const baseConfig = {
+    configurable: {
+      thread_id: threadId,
+      checkpoint_ns: checkpointNs,
+      ...(checkpointId ? { checkpoint_id: checkpointId } : {})
+    }
+  };
+
+  const checkpoints = [];
+  for await (const tuple of checkpointer.list(baseConfig, { limit })) {
+    checkpoints.push(formatCheckpointTuple(tuple, checkpoints.length === 0));
+  }
+
+  const latestTuple = checkpointId
+    ? await checkpointer.getTuple(baseConfig)
+    : checkpoints.length
+      ? await checkpointer.getTuple({
+        configurable: {
+          thread_id: threadId,
+          checkpoint_ns: checkpointNs,
+          checkpoint_id: checkpoints[0].checkpoint_id
+        }
+      })
+      : undefined;
+
+  return {
+    ok: true,
+    checkpoint_backend: "firestore",
+    inspection_generated_at: new Date().toISOString(),
+    thread_id: threadId,
+    checkpoint_ns: checkpointNs,
+    checkpoint_id: checkpointId || null,
+    checkpoint_collection: LANGGRAPH_CHECKPOINT_COLLECTION,
+    writes_collection: LANGGRAPH_CHECKPOINT_WRITES_COLLECTION,
+    count: checkpoints.length,
+    checkpoints,
+    latest: latestTuple ? formatCheckpointTuple(latestTuple, true, { includePreview: true }) : null,
+    note: "Values are decoded from the LangGraph checkpointer and redacted/truncated for UI inspection."
+  };
+}
+
+function formatCheckpointTuple(tuple, latest, options = {}) {
+  const checkpoint = tuple?.checkpoint || {};
+  const channelValues = checkpoint.channel_values || {};
+  const pendingWrites = Array.isArray(tuple?.pendingWrites) ? tuple.pendingWrites : [];
+  const metadata = tuple?.metadata || {};
+  const checkpointId = tuple?.config?.configurable?.checkpoint_id || checkpoint.id || null;
+  const parentCheckpointId = tuple?.parentConfig?.configurable?.checkpoint_id || null;
+  const channels = Object.keys(channelValues).sort();
+  const pendingWriteSummary = pendingWrites.map(([taskId, channel, value]) => ({
+    task_id: taskId,
+    channel,
+    preview: previewJsonValue(redactCheckpointValue(value), 900)
+  }));
+  return {
+    latest: Boolean(latest),
+    checkpoint_id: checkpointId,
+    parent_checkpoint_id: parentCheckpointId,
+    ts: checkpoint.ts || null,
+    version: checkpoint.v || null,
+    channel_count: channels.length,
+    channels,
+    channel_versions: checkpoint.channel_versions || {},
+    metadata: redactCheckpointValue(metadata),
+    pending_writes_count: pendingWrites.length,
+    pending_writes: options.includePreview ? pendingWriteSummary : pendingWriteSummary.slice(0, 8),
+    preview: options.includePreview ? {
+      channel_values: Object.fromEntries(channels.map((channel) => [
+        channel,
+        previewJsonValue(redactCheckpointValue(channelValues[channel]), 3000)
+      ])),
+      checkpoint: previewJsonValue(redactCheckpointValue(checkpoint), 12000)
+    } : undefined
+  };
+}
+
+function redactCheckpointValue(value, depth = 0) {
+  if (depth > 8) return "[Max depth reached]";
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") return value.length > 8000 ? `${value.slice(0, 8000)}... [truncated]` : value;
+  if (typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map((item) => redactCheckpointValue(item, depth + 1));
+  }
+  const output = {};
+  for (const [key, item] of Object.entries(value).slice(0, 80)) {
+    if (/api[_-]?key|authorization|bearer|secret|token|password|credential/i.test(key)) {
+      output[key] = "[redacted]";
+    } else {
+      output[key] = redactCheckpointValue(item, depth + 1);
+    }
+  }
+  return output;
+}
+
+function previewJsonValue(value, maxChars) {
+  const json = JSON.stringify(value, null, 2);
+  if (json.length <= maxChars) return json;
+  return `${json.slice(0, maxChars)}\n... [truncated ${json.length - maxChars} chars]`;
 }
 
 function createExternalLangGraph() {

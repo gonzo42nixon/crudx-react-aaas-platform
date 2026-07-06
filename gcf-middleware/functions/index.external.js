@@ -349,6 +349,46 @@ exports.reactAaasStream = onRequest(
   }
 );
 
+exports.reactAaasCheckpointInspect = onRequest(
+  {
+    region: REGION,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: "512MiB",
+    secrets: [LANGGRAPH_RUNTIME_TOKEN]
+  },
+  async (req, res) => {
+    setCors(res);
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ ok: false, error: "METHOD_NOT_ALLOWED" });
+      return;
+    }
+
+    const runtimeUrl = String(LANGGRAPH_RUNTIME_URL.value() || "").replace(/\/+$/, "");
+    if (!runtimeUrl) {
+      res.status(503).json({ ok: false, error: "LANGGRAPH_RUNTIME_URL_REQUIRED" });
+      return;
+    }
+
+    try {
+      const requestBody = typeof req.body === "object" && req.body ? req.body : {};
+      const result = await inspectStandaloneLangGraphCheckpoints(runtimeUrl, requestBody);
+      res.status(200).json(result);
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message || String(error)
+      });
+    }
+  }
+);
+
 exports.translateAnswer = onRequest(
   {
     region: REGION,
@@ -1391,6 +1431,25 @@ async function streamStandaloneLangGraphRuntime(runtimeUrl, payload, onChunk) {
     throw new Error("External LangGraph stream finished without result event.");
   }
   return finalResult;
+}
+
+async function inspectStandaloneLangGraphCheckpoints(runtimeUrl, payload) {
+  const token = String(LANGGRAPH_RUNTIME_TOKEN.value() || "");
+  const baseUrl = runtimeUrl.replace(/\/invoke$/i, "");
+  const inspectUrl = `${baseUrl}/checkpoints/inspect`;
+  const response = await fetch(inspectUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) {
+    throw new Error(`External checkpoint inspection failed: ${body.error || response.statusText}`);
+  }
+  return body;
 }
 
 function parseSseBlock(block) {
