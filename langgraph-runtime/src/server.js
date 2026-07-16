@@ -2660,6 +2660,9 @@ async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallback
 
 async function executeRelevantFollowupTools(state, langsmith) {
   const tools = Array.isArray(state.agent?.okf?.allowed_tools) ? state.agent.okf.allowed_tools : [];
+  if (/^(?:read|open|start|list|inspect|append)_.*(?:minibpmn|model|process_pid|runtime_event)/i.test(String(state.action || ""))) {
+    return [];
+  }
   let followups = tools
     .filter((tool) => tool?.name && tool.name !== state.action)
     .filter((tool) => shouldRunToolForInput(tool, state.input, state.agent));
