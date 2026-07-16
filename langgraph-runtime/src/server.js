@@ -2694,9 +2694,14 @@ function shouldRunToolForInput(tool, input, agent) {
   const description = String(tool?.description || "").toLowerCase();
   const text = String(input || "").toLowerCase();
   const haystack = `${name} ${description}`;
-  if (/minibpmn|process.pid|model.api.calls|cloud.events/.test(haystack)) {
-    return /minibpmn|bpmn|process model|prozessmodell|api.calls?|endpoints?|message flows?|cloud.events?|\bpid\b|process instance/i.test(input);
-  }
+  if (/list_minibpmn_api_calls/.test(name)) return /api.calls?|endpoints?|message flows?|schnittstellenaufrufe/i.test(input);
+  if (/inspect_minibpmn_model/.test(name)) return /\b(inspect|inspection|count|counts|tasks?|pools?|lanes?|size|struktur|anzahl)\b/i.test(input);
+  if (/read_minibpmn_model_code/.test(name)) return /model code|source code|modellcode|quellcode/i.test(input);
+  if (/inspect_process_pid/.test(name)) return /\bpid\b|process instance|prozessinstanz|execution status|ausf.hrungsstatus/i.test(input);
+  if (/list_model_cloud_events/.test(name)) return /cloud ?events?|associated pids?|zugeordnete pids?/i.test(input);
+  if (/open_minibpmn_model/.test(name)) return /\b(open|show|display|.ffnen|anzeigen)\b/i.test(input) && /minibpmn|bpmn|model|prozessmodell/i.test(input);
+  if (/start_minibpmn_process/.test(name)) return /\b(start|launch|ausf.hren|starte?n?)\b/i.test(input) && /\b(model|process|prozess)\b/i.test(input);
+  if (/append_minibpmn_runtime_event/.test(name)) return /append|persist|store|write|speichern/i.test(input) && /runtime event|cloud ?event/i.test(input);
   if (/calculate|calendar|date|days|business/.test(haystack)) {
     return extractIsoDates(input).length >= 2
       || /\b(from\s+20\d{2}-\d{2}-\d{2}|between\s+20\d{2}-\d{2}-\d{2}|business day|business days|calendar|date range|dated period|period from|start date|end date)\b/i.test(input);
@@ -2804,6 +2809,17 @@ function inferServerTarget(input, agent) {
 function normalizeToolObservation(body, fallback) {
   const value = body.observation || body.answer || body.result || body.message || body.summary;
   if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(body.apiCalls)) {
+    const examples = body.apiCalls.slice(0, 8).map((call) => {
+      const node = call.nodeId || "model metadata";
+      return `${call.method || "GET"} ${call.url || "(no URL)"} [node=${node}, property=${call.property || "unknown"}]`;
+    });
+    return [
+      `Live Model Control API result for ${body.modelKey || "the requested model"}: ${body.count ?? body.apiCalls.length} HTTP API references and ${body.messageFlowCount ?? 0} BPMN message flows.`,
+      "Representative calls:",
+      ...examples
+    ].join("\n");
+  }
   if (Array.isArray(body.snippets) && body.snippets.length) {
     return `Tool observation: ${body.snippets.map((item) => String(item).trim()).filter(Boolean).join(" ")}`;
   }
