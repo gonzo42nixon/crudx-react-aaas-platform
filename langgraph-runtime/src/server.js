@@ -13,7 +13,8 @@ const PORT = Number(process.env.PORT || 8080);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || "https://api.smith.langchain.com";
 const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || "react-aaas-crudx";
-const LANGSMITH_WORKSPACE_ID = process.env.LANGSMITH_WORKSPACE_ID || "";
+const LANGSMITH_WORKSPACE_ID = process.env.LANGSMITH_WORKSPACE_ID || "55357b07-4341-486e-b7f0-1cbb274d6e2e";
+const LANGSMITH_PROJECT_ID = process.env.LANGSMITH_PROJECT_ID || "87c0837f-de53-4740-abcd-2d35d685af50";
 const RUNTIME_TOKEN = process.env.LANGGRAPH_RUNTIME_TOKEN || "";
 const AI_FEEDBACK_ENABLED = process.env.AI_FEEDBACK_ENABLED !== "false";
 const AI_FEEDBACK_TIMEOUT_MS = Number(process.env.AI_FEEDBACK_TIMEOUT_MS || 12000);
@@ -22,12 +23,20 @@ const LANGGRAPH_CHECKPOINT_BACKEND = String(process.env.LANGGRAPH_CHECKPOINT_BAC
 const LANGGRAPH_CHECKPOINT_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_COLLECTION || "langgraph_checkpoints";
 const LANGGRAPH_CHECKPOINT_WRITES_COLLECTION = process.env.LANGGRAPH_CHECKPOINT_WRITES_COLLECTION || "langgraph_checkpoint_writes";
 const LANGGRAPH_AGENT_MEMORY_COLLECTION = process.env.LANGGRAPH_AGENT_MEMORY_COLLECTION || "agent_global_memory";
+const STUDIO_GCF_INVOKE_URL = process.env.STUDIO_GCF_INVOKE_URL || "https://europe-west3-crudx-e0599.cloudfunctions.net/reactAaasInvoke";
+const STUDIO_DEFAULT_AGENT_ID = process.env.STUDIO_DEFAULT_AGENT_ID || "alice-hr";
+const STUDIO_DEFAULT_OKF_KEY = process.env.STUDIO_DEFAULT_OKF_KEY || "CRUDX-5432U-D58X8-52X8U";
+const STUDIO_DEFAULT_OPENAPI_KEY = process.env.STUDIO_DEFAULT_OPENAPI_KEY || "CRUDX-R8U85-DR8U8-U8XDU";
+const STUDIO_ASSISTANT_ID = process.env.STUDIO_ASSISTANT_ID || "agent";
 
 let graphCheckpointer;
 let agentMemoryFirestore;
+const studioRuns = new Map();
+const studioThreads = new Map();
+const studioThreadStates = new Map();
 
 const server = http.createServer(async (req, res) => {
-  setCors(res);
+  setCors(res, req);
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -41,7 +50,20 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "crudx-react-aaas-langgraph-runtime",
       runtime: "external-langgraph",
-      graph: "crudx_okf_react_discourse"
+      graph: "crudx_cam_react_discourse"
+    });
+    return;
+  }
+
+  try {
+    if (await handleStudioAgentServerRequest(req, res, url)) {
+      return;
+    }
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: error.message || String(error),
+      route: "studio_agent_server"
     });
     return;
   }
@@ -145,6 +167,767 @@ async function streamGraph(req, res) {
   }
 }
 
+async function handleStudioAgentServerRequest(req, res, url) {
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/info")) {
+    sendJson(res, 200, studioInfo());
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/deploy") {
+    sendJson(res, 200, studioDeployment());
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/assistants") {
+    sendJson(res, 200, [studioAssistant()]);
+    return true;
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/assistants/search") {
+    res.setHeader("X-Pagination-Next", "");
+    sendJson(res, 200, [studioAssistant()]);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/assistants/count") {
+    sendJson(res, 200, 1);
+    return true;
+  }
+
+  const assistantMatch = url.pathname.match(/^\/assistants\/([^/]+)$/);
+  if (req.method === "GET" && assistantMatch) {
+    const assistant = studioAssistant(decodeURIComponent(assistantMatch[1]));
+    sendJson(res, 200, assistant);
+    return true;
+  }
+
+  if ((req.method === "PATCH" || req.method === "POST") && assistantMatch) {
+    const assistant = studioAssistant(decodeURIComponent(assistantMatch[1]));
+    sendJson(res, 200, assistant);
+    return true;
+  }
+
+  const assistantVersionsMatch = url.pathname.match(/^\/assistants\/([^/]+)\/versions$/);
+  if (req.method === "POST" && assistantVersionsMatch) {
+    sendJson(res, 200, [studioAssistant(decodeURIComponent(assistantVersionsMatch[1]))]);
+    return true;
+  }
+
+  const assistantLatestMatch = url.pathname.match(/^\/assistants\/([^/]+)\/latest$/);
+  if (req.method === "POST" && assistantLatestMatch) {
+    sendJson(res, 200, studioAssistant(decodeURIComponent(assistantLatestMatch[1])));
+    return true;
+  }
+
+  const assistantGraphMatch = url.pathname.match(/^\/assistants\/([^/]+)\/graph$/);
+  if (req.method === "GET" && assistantGraphMatch) {
+    const xray = parseStudioXray(url.searchParams.get("xray"));
+    const graph = await studioGraph(xray);
+    sendJson(res, 200, graph);
+    return true;
+  }
+
+  const assistantSchemasMatch = url.pathname.match(/^\/assistants\/([^/]+)\/schemas$/);
+  if (req.method === "GET" && assistantSchemasMatch) {
+    sendJson(res, 200, studioGraphSchemas());
+    return true;
+  }
+
+  const assistantSubgraphsMatch = url.pathname.match(/^\/assistants\/([^/]+)\/subgraphs(?:\/.*)?$/);
+  if (req.method === "GET" && assistantSubgraphsMatch) {
+    sendJson(res, 200, {});
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/threads") {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      body = {};
+    }
+    const now = new Date().toISOString();
+    const threadId = String(body.thread_id || body.threadId || `studio_thread_${crypto.randomUUID()}`);
+    const thread = studioThread(threadId, body.metadata || {}, now);
+    studioThreads.set(threadId, thread);
+    sendJson(res, 200, thread);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/threads/search") {
+    sendJson(res, 200, []);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/threads/count") {
+    sendJson(res, 200, 0);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/threads/prune") {
+    sendJson(res, 200, { pruned_count: 0 });
+    return true;
+  }
+
+  const threadMatch = url.pathname.match(/^\/threads\/([^/]+)$/);
+  if (req.method === "GET" && threadMatch) {
+    const threadId = decodeURIComponent(threadMatch[1]);
+    sendJson(res, 200, studioThreads.get(threadId) || studioThread(threadId));
+    return true;
+  }
+
+  if ((req.method === "PATCH" || req.method === "DELETE") && threadMatch) {
+    const threadId = decodeURIComponent(threadMatch[1]);
+    if (req.method === "DELETE") {
+      studioThreads.delete(threadId);
+      studioThreadStates.delete(threadId);
+      sendJson(res, 200, null);
+    } else {
+      const thread = studioThread(threadId);
+      studioThreads.set(threadId, thread);
+      sendJson(res, 200, thread);
+    }
+    return true;
+  }
+
+  const threadCopyMatch = url.pathname.match(/^\/threads\/([^/]+)\/copy$/);
+  if (req.method === "POST" && threadCopyMatch) {
+    const sourceThreadId = decodeURIComponent(threadCopyMatch[1]);
+    sendJson(res, 200, studioThread(`copy_${sourceThreadId}_${crypto.randomUUID()}`, { copied_from: sourceThreadId }));
+    return true;
+  }
+
+  const threadHistoryMatch = url.pathname.match(/^\/threads\/([^/]+)\/history$/);
+  if ((req.method === "GET" || req.method === "POST") && threadHistoryMatch) {
+    const threadId = decodeURIComponent(threadHistoryMatch[1]);
+    const states = studioThreadStates.get(threadId) || [studioState(threadId)];
+    sendJson(res, 200, states);
+    return true;
+  }
+
+  const stateMatch = url.pathname.match(/^\/threads\/([^/]+)\/state$/);
+  if (req.method === "GET" && stateMatch) {
+    const threadId = decodeURIComponent(stateMatch[1]);
+    const states = studioThreadStates.get(threadId);
+    sendJson(res, 200, states?.[0] || studioState(threadId));
+    return true;
+  }
+
+  if ((req.method === "POST" || req.method === "PATCH") && stateMatch) {
+    const threadId = decodeURIComponent(stateMatch[1]);
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      body = {};
+    }
+    const state = studioState(threadId, body.values || { messages: [] }, body.metadata || {}, body.checkpoint);
+    rememberStudioState(threadId, state);
+    sendJson(res, 200, state.config || { configurable: { thread_id: threadId } });
+    return true;
+  }
+
+  const stateCheckpointMatch = url.pathname.match(/^\/threads\/([^/]+)\/state(?:\/checkpoint|\/[^/]+)$/);
+  if ((req.method === "GET" || req.method === "POST") && stateCheckpointMatch) {
+    const threadId = decodeURIComponent(stateCheckpointMatch[1]);
+    sendJson(res, 200, studioState(threadId));
+    return true;
+  }
+
+  const threadCommandsMatch = url.pathname.match(/^\/threads\/([^/]+)\/commands$/);
+  if (req.method === "POST" && threadCommandsMatch) {
+    sendJson(res, 200, { type: "success" });
+    return true;
+  }
+
+  const threadEventsMatch = url.pathname.match(/^\/threads\/([^/]+)\/stream\/events$/);
+  if (req.method === "POST" && threadEventsMatch) {
+    const threadId = decodeURIComponent(threadEventsMatch[1]);
+    writeSseHeaders(res);
+    writeSseEvent(res, "metadata", { thread_id: threadId, assistant_id: STUDIO_ASSISTANT_ID });
+    writeSseEvent(res, "end", { ok: true, thread_id: threadId });
+    res.end();
+    return true;
+  }
+
+  const threadStreamMatch = url.pathname.match(/^\/threads\/([^/]+)\/stream$/);
+  if (req.method === "GET" && threadStreamMatch) {
+    const threadId = decodeURIComponent(threadStreamMatch[1]);
+    writeSseHeaders(res);
+    writeSseEvent(res, "metadata", { thread_id: threadId, assistant_id: STUDIO_ASSISTANT_ID });
+    writeSseEvent(res, "values", { messages: [], answer: "" });
+    writeSseEvent(res, "end", { ok: true, thread_id: threadId });
+    res.end();
+    return true;
+  }
+
+  const runStreamMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs\/stream$/);
+  if (req.method === "POST" && runStreamMatch) {
+    await streamStudioRun(req, res, decodeURIComponent(runStreamMatch[1]));
+    return true;
+  }
+
+  const runWaitMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs\/wait$/);
+  if (req.method === "POST" && runWaitMatch) {
+    const body = await readJsonBody(req);
+    const threadId = decodeURIComponent(runWaitMatch[1]);
+    const result = await waitStudioRun(body, threadId);
+    res.setHeader("Content-Location", `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(result.run.run_id)}`);
+    sendJson(res, 200, result.values);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/runs/stream") {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      body = {};
+    }
+    await streamStudioRunFromBody(res, body, String(body.thread_id || body.threadId || `studio_thread_${crypto.randomUUID()}`));
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/runs/wait") {
+    const body = await readJsonBody(req);
+    const result = await waitStudioRun(body, String(body.thread_id || body.threadId || `studio_thread_${crypto.randomUUID()}`));
+    res.setHeader("Content-Location", `/threads/${encodeURIComponent(result.run.thread_id)}/runs/${encodeURIComponent(result.run.run_id)}`);
+    sendJson(res, 200, result.values);
+    return true;
+  }
+
+  const runMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs$/);
+  if (req.method === "GET" && runMatch) {
+    const threadId = decodeURIComponent(runMatch[1]);
+    const runs = Array.from(studioRuns.values())
+      .filter((run) => run.thread_id === threadId)
+      .map((run) => run.run)
+      .filter((run) => {
+        const status = url.searchParams.get("status");
+        return !status || run.status === status;
+      });
+    sendJson(res, 200, runs);
+    return true;
+  }
+
+  if (req.method === "POST" && runMatch) {
+    const body = await readJsonBody(req);
+    const threadId = decodeURIComponent(runMatch[1]);
+    const result = await waitStudioRun(body, threadId);
+    res.setHeader("Content-Location", `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(result.run.run_id)}`);
+    sendJson(res, 200, result.run);
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/runs") {
+    const body = await readJsonBody(req);
+    const result = await waitStudioRun(body, String(body.thread_id || body.threadId || `studio_thread_${crypto.randomUUID()}`));
+    res.setHeader("Content-Location", `/threads/${encodeURIComponent(result.run.thread_id)}/runs/${encodeURIComponent(result.run.run_id)}`);
+    sendJson(res, 200, result.run);
+    return true;
+  }
+
+  const runDetailMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs\/([^/]+)$/);
+  if (req.method === "GET" && runDetailMatch) {
+    const threadId = decodeURIComponent(runDetailMatch[1]);
+    const runId = decodeURIComponent(runDetailMatch[2]);
+    const stored = studioRuns.get(runId);
+    sendJson(res, 200, stored?.run || studioRun(threadId, STUDIO_ASSISTANT_ID, "success", runId));
+    return true;
+  }
+
+  const runJoinMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs\/([^/]+)\/join$/);
+  if (req.method === "GET" && runJoinMatch) {
+    const runId = decodeURIComponent(runJoinMatch[2]);
+    const stored = studioRuns.get(runId);
+    sendJson(res, 200, stored?.values || { messages: [], answer: "" });
+    return true;
+  }
+
+  const runJoinStreamMatch = url.pathname.match(/^\/threads\/([^/]+)\/runs\/([^/]+)\/stream$/);
+  if (req.method === "GET" && runJoinStreamMatch) {
+    const threadId = decodeURIComponent(runJoinStreamMatch[1]);
+    const runId = decodeURIComponent(runJoinStreamMatch[2]);
+    const stored = studioRuns.get(runId);
+    writeSseHeaders(res, { "Content-Location": `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}` });
+    writeSseEvent(res, "metadata", { run_id: runId, thread_id: threadId, assistant_id: STUDIO_ASSISTANT_ID });
+    writeSseEvent(res, "values", stored?.values || { messages: [], answer: "" });
+    writeSseEvent(res, "end", { ok: true, run_id: runId, thread_id: threadId });
+    res.end();
+    return true;
+  }
+
+  return false;
+}
+
+function studioInfo() {
+  return {
+    name: "CRUDX ReAct AaaS LangGraph Agent Server",
+    version: "1.0.0",
+    graphs: [STUDIO_ASSISTANT_ID],
+    assistants: [studioAssistant()],
+    capabilities: {
+      threads: true,
+      runs: true,
+      streaming: true,
+      crudx_gcf_bridge: true
+    },
+    defaults: studioDefaults()
+  };
+}
+
+function studioDeployment() {
+  return {
+    deployment_id: "crudx-react-aaas-cloud-run",
+    name: "CRUDX ReAct AaaS Cloud Run Runtime",
+    revision_id: process.env.K_REVISION || null,
+    status: "ready",
+    graphs: {
+      [STUDIO_ASSISTANT_ID]: {
+        graph_id: STUDIO_ASSISTANT_ID,
+        name: "CRUDX ReAct AaaS Agent"
+      }
+    },
+    assistants: [studioAssistant()],
+    default_assistant_id: STUDIO_ASSISTANT_ID,
+    metadata: {
+      runtime: "cloud-run-langgraph",
+      region: "europe-west3",
+      gcf_bridge: STUDIO_GCF_INVOKE_URL
+    }
+  };
+}
+
+function studioAssistantsPage() {
+  return {
+    assistants: [studioAssistant()],
+    next: null
+  };
+}
+
+function studioAssistant(assistantId = STUDIO_ASSISTANT_ID) {
+  const now = new Date().toISOString();
+  return {
+    assistant_id: assistantId || STUDIO_ASSISTANT_ID,
+    graph_id: STUDIO_ASSISTANT_ID,
+    name: "CRUDX ReAct AaaS Agent",
+    description: "LangSmith Studio adapter for the CRUDX ReAct AaaS runtime. Studio calls are bridged through the CRUDX Cloud Function middleware so OKF documents remain the source of truth.",
+    config: {
+      configurable: studioDefaults()
+    },
+    metadata: {
+        runtime: "cloud-run-langgraph",
+      bridge: "gcf",
+      gcf_invoke_url: STUDIO_GCF_INVOKE_URL
+    },
+    context: null,
+    version: 1,
+    created_at: new Date(0).toISOString(),
+    updated_at: now
+  };
+}
+
+async function studioGraph(xray) {
+  const graph = createExternalLangGraph();
+  const drawable = await graph.getGraphAsync({ xray });
+  const serialized = JSON.parse(JSON.stringify(drawable));
+  return {
+    graph_id: STUDIO_ASSISTANT_ID,
+    nodes: Array.isArray(serialized.nodes) ? serialized.nodes : [],
+    edges: Array.isArray(serialized.edges) ? serialized.edges : []
+  };
+}
+
+function studioGraphSchemas() {
+  const inputSchema = {
+    type: "object",
+    properties: {
+      messages: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            role: { type: "string" },
+            content: { type: "string" }
+          }
+        }
+      },
+      input: { type: "string" },
+      query: { type: "string" }
+    },
+    additionalProperties: true
+  };
+  const outputSchema = {
+    type: "object",
+    properties: {
+      messages: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            role: { type: "string" },
+            content: { type: "string" }
+          }
+        }
+      },
+      answer: { type: "string" },
+      result: { type: "object" }
+    },
+    additionalProperties: true
+  };
+  return {
+    graph_id: STUDIO_ASSISTANT_ID,
+    input_schema: inputSchema,
+    output_schema: outputSchema,
+    state_schema: {
+      type: "object",
+      properties: {
+        messages: inputSchema.properties.messages,
+        answer: { type: "string" },
+        graph: { type: "object" },
+        langsmith: { type: "object" }
+      },
+      additionalProperties: true
+    },
+    config_schema: {
+      type: "object",
+      properties: {
+        configurable: {
+          type: "object",
+          properties: {
+            agent_id: { type: "string", default: STUDIO_DEFAULT_AGENT_ID },
+            okf_key: { type: "string", default: STUDIO_DEFAULT_OKF_KEY },
+            openapi_key: { type: "string", default: STUDIO_DEFAULT_OPENAPI_KEY }
+          },
+          additionalProperties: true
+        }
+      },
+      additionalProperties: true
+    },
+    context_schema: null
+  };
+}
+
+function parseStudioXray(value) {
+  if (value === null || value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : Boolean(value);
+}
+
+function studioDefaults() {
+  return {
+    agent_id: STUDIO_DEFAULT_AGENT_ID,
+    okf_key: STUDIO_DEFAULT_OKF_KEY,
+    openapi_key: STUDIO_DEFAULT_OPENAPI_KEY
+  };
+}
+
+function studioThread(threadId, metadata = {}, now = new Date().toISOString()) {
+  const state = studioThreadStates.get(threadId)?.[0];
+  return {
+    thread_id: threadId,
+    created_at: now,
+    updated_at: now,
+    state_updated_at: now,
+    metadata: {
+      ...metadata,
+      source: metadata.source || "langsmith_studio"
+    },
+    status: "idle",
+    values: state?.values || { messages: [] },
+    interrupts: {},
+    config: { configurable: { thread_id: threadId } }
+  };
+}
+
+function studioCheckpoint(threadId, checkpointId = null) {
+  return {
+    thread_id: threadId,
+    checkpoint_ns: "",
+    checkpoint_id: checkpointId || stableStudioCheckpointId(threadId),
+    checkpoint_map: null
+  };
+}
+
+function studioState(threadId, values = { messages: [] }, metadata = {}, checkpoint = null) {
+  const now = new Date().toISOString();
+  const resolvedCheckpoint = checkpoint || studioCheckpoint(threadId);
+  return {
+    values,
+    next: [],
+    checkpoint: resolvedCheckpoint,
+    metadata: {
+      ...metadata,
+      thread_id: threadId,
+      source: metadata.source || "input",
+      step: Number.isFinite(metadata.step) ? metadata.step : 0,
+      writes: metadata.writes ?? null,
+      parents: metadata.parents || {}
+    },
+    created_at: now,
+    parent_checkpoint: null,
+    tasks: []
+  };
+}
+
+function rememberStudioState(threadId, state) {
+  const states = studioThreadStates.get(threadId) || [];
+  studioThreadStates.set(threadId, [state, ...states].slice(0, 20));
+  const thread = studioThread(threadId, { source: "langsmith_studio" });
+  studioThreads.set(threadId, thread);
+}
+
+function stableStudioCheckpointId(threadId) {
+  return `studio_${crypto.createHash("sha256").update(String(threadId || "thread")).digest("hex").slice(0, 24)}`;
+}
+
+function studioRun(threadId, assistantId = STUDIO_ASSISTANT_ID, status = "success", runId = `studio_run_${crypto.randomUUID()}`) {
+  const now = new Date().toISOString();
+  return {
+    run_id: runId,
+    thread_id: threadId,
+    assistant_id: assistantId || STUDIO_ASSISTANT_ID,
+    status,
+    created_at: now,
+    updated_at: now,
+    kwargs: {},
+    multitask_strategy: "reject",
+    metadata: { source: "crudx-react-aaas-agent-server" }
+  };
+}
+
+async function waitStudioRun(body, threadId) {
+  const runId = String(body.run_id || body.runId || `studio_run_${crypto.randomUUID()}`);
+  const assistantId = String(body.assistant_id || body.assistantId || STUDIO_ASSISTANT_ID);
+  const payload = buildStudioGcfPayload({ ...body, run_id: runId, assistant_id: assistantId }, threadId, runId);
+  const input = String(payload.input || "").trim();
+  const run = studioRun(threadId, assistantId, input ? "running" : "success", runId);
+  if (!input) {
+    const emptyValues = {
+      messages: [],
+      answer: "",
+      notice: "No input was submitted."
+    };
+    const completedRun = { ...run, status: "success", updated_at: new Date().toISOString() };
+    rememberStudioRun(runId, threadId, completedRun, emptyValues);
+    rememberStudioState(threadId, studioState(threadId, emptyValues, { source: "empty_run", step: 0 }));
+    return { run: completedRun, values: emptyValues };
+  }
+  const result = await invokeCrudxGcfForStudio(payload);
+  const answer = String(result.answer || result.output || result.text || "");
+  const values = {
+    messages: [
+      { type: "human", role: "user", content: input },
+      { type: "ai", role: "assistant", content: answer }
+    ],
+    input,
+    answer,
+    result
+  };
+  const completedRun = {
+    ...run,
+    status: "success",
+    updated_at: new Date().toISOString(),
+    metadata: {
+      ...run.metadata,
+      run_key: result.run_key || null,
+      langsmith: result.langsmith || null
+    }
+  };
+  rememberStudioRun(runId, threadId, completedRun, values);
+  rememberStudioState(threadId, studioState(threadId, values, { source: "run", step: 1, run_id: runId }));
+  return { run: completedRun, values };
+}
+
+function rememberStudioRun(runId, threadId, run, values) {
+  studioRuns.set(runId, {
+    thread_id: threadId,
+    run,
+    values,
+    stored_at: Date.now()
+  });
+  if (studioRuns.size > 100) {
+    const oldest = Array.from(studioRuns.entries()).sort((a, b) => a[1].stored_at - b[1].stored_at).slice(0, studioRuns.size - 100);
+    for (const [key] of oldest) studioRuns.delete(key);
+  }
+}
+
+async function streamStudioRun(req, res, threadId) {
+  const body = await readJsonBody(req);
+  await streamStudioRunFromBody(res, body, threadId);
+}
+
+async function streamStudioRunFromBody(res, body, threadId) {
+  const runId = String(body.run_id || body.runId || `studio_run_${crypto.randomUUID()}`);
+  const assistantId = String(body.assistant_id || body.assistantId || STUDIO_ASSISTANT_ID);
+  writeSseHeaders(res, { "Content-Location": `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}` });
+  const send = (event, data) => writeSseEvent(res, event, data);
+  try {
+    const payload = buildStudioGcfPayload(body, threadId, runId);
+    const input = String(payload.input || "").trim();
+    send("metadata", {
+      run_id: runId,
+      thread_id: threadId,
+      assistant_id: assistantId,
+      graph_id: STUDIO_ASSISTANT_ID
+    });
+    send("updates", {
+      studio_bridge: {
+        status: "started",
+        target: "crudx-gcf",
+        okf_key: payload.okf_key,
+        agent_id: payload.agent_id
+      }
+    });
+    const result = await invokeCrudxGcfForStudio(payload);
+    const answer = String(result.answer || result.output || result.text || "");
+    const values = {
+      messages: [
+        ...(input ? [{ type: "human", role: "user", content: input }] : []),
+        { type: "ai", role: "assistant", content: answer }
+      ],
+      input,
+      answer,
+      result
+    };
+    const completedRun = studioRun(threadId, assistantId, "success", runId);
+    rememberStudioRun(runId, threadId, completedRun, values);
+    rememberStudioState(threadId, studioState(threadId, values, { source: "stream", step: 1, run_id: runId }));
+    send("updates", {
+      agent: {
+        status: "completed",
+        answer,
+        run_key: result.run_key || null,
+        langsmith: result.langsmith || null
+      }
+    });
+    send("values", values);
+    send("end", { ok: true, run_id: runId, thread_id: threadId, assistant_id: assistantId });
+  } catch (error) {
+    send("error", {
+      ok: false,
+      run_id: runId,
+      thread_id: threadId,
+      error: error.message || String(error)
+    });
+  } finally {
+    res.end();
+  }
+}
+
+function buildStudioGcfPayload(body, threadId, runId) {
+  const config = typeof body.config === "object" && body.config ? body.config : {};
+  const configurable = {
+    ...studioDefaults(),
+    ...(typeof body.configurable === "object" && body.configurable ? body.configurable : {}),
+    ...(typeof config.configurable === "object" && config.configurable ? config.configurable : {}),
+    ...(typeof body.metadata === "object" && body.metadata ? pickConfigFields(body.metadata) : {})
+  };
+  const input = extractStudioInput(body);
+  const messages = extractStudioMessages(body);
+  const okfKey = String(configurable.okf_key || configurable.okfKey || STUDIO_DEFAULT_OKF_KEY);
+  const agentId = String(configurable.agent_id || configurable.agentId || STUDIO_DEFAULT_AGENT_ID);
+  const openapiKey = String(configurable.openapi_key || configurable.openapiKey || STUDIO_DEFAULT_OPENAPI_KEY);
+  return {
+    input,
+    query: input,
+    messages,
+    okf_key: okfKey,
+    agent_id: agentId,
+    openapi_key: openapiKey,
+    thread_id: threadId,
+    run_key: runId,
+    metadata: {
+      ...(typeof body.metadata === "object" && body.metadata ? body.metadata : {}),
+      source: "langsmith_studio_agent_server",
+      thread_id: threadId,
+      session_id: threadId,
+      run_id: runId,
+      agent_id: agentId,
+      okf_key: okfKey,
+      openapi_key: openapiKey
+    }
+  };
+}
+
+function pickConfigFields(value) {
+  const result = {};
+  for (const key of ["agent_id", "agentId", "okf_key", "okfKey", "openapi_key", "openapiKey"]) {
+    if (value[key]) result[key] = value[key];
+  }
+  return result;
+}
+
+function extractStudioInput(body) {
+  const candidates = [
+    body.input,
+    body.inputs,
+    body.query,
+    body.message,
+    body.messages,
+    body.values
+  ];
+  for (const candidate of candidates) {
+    const text = extractTextFromStudioValue(candidate);
+    if (text) return text;
+  }
+  return "";
+}
+
+function extractStudioMessages(body) {
+  const raw = body?.input?.messages || body?.inputs?.messages || body.messages || [];
+  if (!Array.isArray(raw)) return [];
+  return raw.map((message) => ({
+    role: String(message.role || message.type || "user"),
+    content: extractTextFromStudioValue(message.content || message.text || message)
+  })).filter((message) => message.content);
+}
+
+function extractTextFromStudioValue(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const text = extractTextFromStudioValue(value[index]);
+      if (text) return text;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    if (typeof value.content === "string") return value.content.trim();
+    if (typeof value.text === "string") return value.text.trim();
+    if (typeof value.query === "string") return value.query.trim();
+    if (typeof value.input === "string") return value.input.trim();
+    if (typeof value.Query === "string") return value.Query.trim();
+    if (typeof value.Input === "string") return value.Input.trim();
+    if (typeof value.message === "string") return value.message.trim();
+    if (Array.isArray(value.messages)) return extractTextFromStudioValue(value.messages);
+    if (Array.isArray(value.content)) return extractTextFromStudioValue(value.content);
+  }
+  return "";
+}
+
+async function invokeCrudxGcfForStudio(payload) {
+  const response = await fetch(STUDIO_GCF_INVOKE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  if (!response.ok || data.ok === false) {
+    const message = data.error || data.message || response.statusText || `GCF invoke failed with HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return data;
+}
+
 async function invokeGraph(requestBody, options = {}) {
   const startedAt = new Date().toISOString();
   const input = String(requestBody.input || requestBody.query || "").trim();
@@ -177,7 +960,9 @@ async function invokeGraph(requestBody, options = {}) {
   if (!input) throw new Error("INPUT_REQUIRED");
   if (!okfEnvelope) throw new Error("OKF_ENVELOPE_REQUIRED");
 
-  const langsmith = createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata });
+  const runtimePolicy = runtimePolicyFromEnvelope(okfEnvelope);
+  metadata.runtime_policy = runtimePolicy;
+  const langsmith = createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata, runtimePolicy });
   await ensureLangSmithProject(langsmith);
   await postLangSmithRun(langsmith);
 
@@ -219,7 +1004,11 @@ async function invokeGraph(requestBody, options = {}) {
     graphResult.graphSummary.agent_memory = summarizeAgentMemoryForGraph(persistedAgentMemory);
     trace.push(step("langgraph_runtime", "agent_memory_persisted", graphResult.graphSummary.agent_memory));
 
-    await postLangGraphSpans(langsmith, graphResult, trace);
+    if (runtimePolicy.persist_trace_run_metadata) {
+      await postLangGraphSpans(langsmith, graphResult, trace);
+    } else {
+      trace.push(step("langgraph_runtime", "trace_metadata_persistence_skipped", { reason: "disabled_by_okf_runtime_policy" }));
+    }
 
     trace.push(step("langgraph_runtime", "checkpoint_inspection", graphResult.graphSummary.checkpoint_inspection));
 
@@ -250,7 +1039,7 @@ async function invokeGraph(requestBody, options = {}) {
       agent: graphResult.agent,
       runtime: {
         service: "external-langgraph",
-        graph: "crudx_okf_react_discourse",
+        graph: "crudx_cam_react_discourse",
         started_at: startedAt,
         completed_at: new Date().toISOString()
       }
@@ -632,6 +1421,14 @@ function createExternalLangGraph() {
       default: () => null
     }),
     agent: Annotation(),
+    runtimePolicy: Annotation({
+      reducer: (_left, right) => right,
+      default: () => defaultRuntimePolicy()
+    }),
+    confidenceSignal: Annotation({
+      reducer: (_left, right) => right,
+      default: () => null
+    }),
     plan: Annotation(),
     action: Annotation(),
     observation: Annotation(),
@@ -656,26 +1453,129 @@ function createExternalLangGraph() {
   });
 
   const graphBuilder = new StateGraph(GraphState)
-    .addNode("load_okf", async (state, config) => {
+    .addNode("load_cam", async (state, config) => {
       const { langsmith, trace } = config.configurable || {};
       const okfEnvelope = await withLangSmithChild(
         langsmith,
-        "LangGraph Node: load_okf",
+        "LangGraph Node: load_cam",
         "retriever",
         { okf_key: state.okfKey },
-        { graph_node: "load_okf", crudx_key: state.okfKey },
+        { graph_node: "load_cam", crudx_key: state.okfKey },
         async () => state.okfEnvelope,
         (envelope) => ({ okf_key: state.okfKey, document_loaded: Boolean(envelope) })
       );
       const agent = unwrapOkfAgent(okfEnvelope, state.okfKey);
-      trace?.push(step("langgraph", "node_load_okf", {
+      trace?.push(step("langgraph", "node_load_cam", {
         okf_key: state.okfKey,
         agent_id: agent.agent_id,
         tools: agent.okf.allowed_tools.map((tool) => tool.name)
       }));
       return {
         agent,
-        graphEvents: [{ node: "load_okf", okf_key: state.okfKey, agent_id: agent.agent_id }]
+        runtimePolicy: normalizeRuntimePolicy(agent.okf.runtime_policy || agent.runtime_policy),
+        graphEvents: [{ node: "load_cam", cam_key: state.okfKey, okf_key: state.okfKey, agent_id: agent.agent_id }]
+      };
+    })
+    .addNode("input_validation", async (state, config) => {
+      const { langsmith, trace } = config.configurable || {};
+      const policy = normalizeRuntimePolicy(state.runtimePolicy);
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: input_validation",
+        "chain",
+        { enabled: policy.input_validation, input_chars: String(state.input || "").length },
+        { graph_node: "input_validation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => ({
+          enabled: policy.input_validation,
+          ok: policy.input_validation ? Boolean(String(state.input || "").trim()) : true,
+          reason: policy.input_validation ? "input_present" : "disabled_by_okf_runtime_policy"
+        }),
+        (result) => result
+      );
+      if (!result.ok) throw new Error("INPUT_VALIDATION_FAILED");
+      trace?.push(step("langgraph", "node_input_validation", result));
+      return {
+        graphEvents: [{ node: "input_validation", enabled: result.enabled, ok: result.ok, reason: result.reason }]
+      };
+    })
+    .addNode("confidence_check", async (state, config) => {
+      const { langsmith, trace } = config.configurable || {};
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: confidence_check",
+        "chain",
+        {
+          input: state.input,
+          provided: Boolean(state.metadata?.confidence_signal)
+        },
+        { graph_node: "confidence_check", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => normalizeConfidenceSignalForGraph(state.metadata?.confidence_signal, state.agent),
+        (result) => result
+      );
+      trace?.push(step("langgraph", "node_confidence_check", {
+        ...result,
+        confidence_preview: result.provided
+          ? `${result.confidence ?? "-"} / threshold ${result.threshold ?? "-"} -> ${result.route || "answer_current_agent"}`
+          : "No confidence signal was provided by the caller."
+      }));
+      return {
+        confidenceSignal: result.provided ? result : null,
+        graphEvents: [{ node: "confidence_check", provided: Boolean(result.provided), confidence: result.confidence ?? null, route: result.route || "not_provided" }]
+      };
+    })
+    .addNode("generic_llm_answer", async (state, config) => {
+      const configurable = config.configurable || {};
+      const dryRun = configurable.dryRun === true || state.dryRun === true;
+      const geminiKey = configurable.geminiKey || process.env.GEMINI_API_KEY || "";
+      const { langsmith, trace } = configurable;
+      const prompt = buildGenericFallbackPrompt(state);
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: generic_llm_answer",
+        dryRun ? "chain" : "llm",
+        {
+          model: dryRun ? "deterministic_generic_fallback" : GEMINI_MODEL,
+          input: state.input,
+          confidence_signal: state.confidenceSignal || null
+        },
+        {
+          graph_node: "generic_llm_answer",
+          ls_provider: dryRun ? "internal" : "google_genai",
+          ls_model_name: dryRun ? "deterministic_generic_fallback" : GEMINI_MODEL,
+          agent_id: state.agent.agent_id,
+          okf_key: state.okfKey
+        },
+        async () => {
+          if (dryRun) {
+            return { raw: null, text: buildScopedMissingInfoAnswer(state), generic: true };
+          }
+          if (!geminiKey) {
+            throw new Error("GEMINI_API_KEY is not available for generic fallback answer");
+          }
+          const llmResult = await callGemini(geminiKey, prompt);
+          return { ...llmResult, generic: true };
+        },
+        (result) => ({
+          model: dryRun ? "deterministic_generic_fallback" : GEMINI_MODEL,
+          text_chars: (result.text || "").length,
+          generic: true
+        })
+      );
+      const finalAnswer = stripAgentGreeting(String(result.text || "").trim(), state);
+      trace?.push(step("langgraph", "node_generic_llm_answer", {
+        model: dryRun ? "deterministic_generic_fallback" : GEMINI_MODEL,
+        route: state.confidenceSignal?.route || "domain_fallback",
+        confidence: state.confidenceSignal?.confidence ?? null,
+        threshold: state.confidenceSignal?.threshold ?? null,
+        finish_reason: getGeminiFinishReason(result.raw || null) || null,
+        text_chars: finalAnswer.length,
+        answer: finalAnswer,
+        answer_preview: previewText(finalAnswer)
+      }));
+      return {
+        finalAnswer,
+        llmRaw: result.raw || state.llmRaw || null,
+        graphEvents: [{ node: "generic_llm_answer", route: state.confidenceSignal?.route || "domain_fallback", text_chars: finalAnswer.length }]
       };
     })
     .addNode("context_review", async (state, config) => {
@@ -917,20 +1817,40 @@ function createExternalLangGraph() {
     .addNode("critic_feedback", async (state, config) => {
       const configurable = config.configurable || {};
       const { langsmith, trace } = configurable;
+      const policy = normalizeRuntimePolicy(state.runtimePolicy);
+      const critiqueDecision = answerNeedsExternalCritique(state);
       const result = await withLangSmithChild(
         langsmith,
         "LangGraph Node: critic_feedback",
         "chain",
         {
-          enabled: AI_FEEDBACK_ENABLED,
+          enabled: AI_FEEDBACK_ENABLED && policy.external_ai_critique,
+          will_run_external_critic: critiqueDecision.run,
+          decision_reason: critiqueDecision.reason,
           input: state.input,
           draft_chars: (state.draftAnswer || "").length
         },
         { graph_node: "critic_feedback", agent_id: state.agent.agent_id, okf_key: state.okfKey },
-        async () => ({ criticFeedback: await collectAiCriticFeedback(state) }),
+        async () => ({
+          criticFeedback: policy.external_ai_critique && critiqueDecision.run
+            ? await collectAiCriticFeedback(state)
+            : {
+                enabled: false,
+                configured: false,
+                reviews: [],
+                errors: [],
+                skipped: true,
+                decision_reason: critiqueDecision.reason,
+                summary: policy.external_ai_critique
+                  ? `External AI critique skipped: ${critiqueDecision.reason}.`
+                  : "External AI critique is disabled by this agent's OKF runtime_policy."
+              }
+        }),
         (result) => ({
           enabled: result.criticFeedback.enabled,
           configured: result.criticFeedback.configured,
+          skipped: Boolean(result.criticFeedback.skipped),
+          decision_reason: result.criticFeedback.decision_reason || critiqueDecision.reason,
           review_count: result.criticFeedback.reviews.length,
           providers: result.criticFeedback.reviews.map((review) => review.provider),
           errors: result.criticFeedback.errors
@@ -940,6 +1860,8 @@ function createExternalLangGraph() {
       trace?.push(step("langgraph", "node_critic_feedback", {
         enabled: feedback.enabled,
         configured: feedback.configured,
+        skipped: Boolean(feedback.skipped),
+        decision_reason: feedback.decision_reason || critiqueDecision.reason,
         review_count: feedback.reviews.length,
         providers: feedback.reviews.map((review) => review.provider),
         feedback: formatCriticFeedback(feedback),
@@ -952,6 +1874,8 @@ function createExternalLangGraph() {
           node: "critic_feedback",
           enabled: feedback.enabled,
           configured: feedback.configured,
+          skipped: Boolean(feedback.skipped),
+          decision_reason: feedback.decision_reason || critiqueDecision.reason,
           review_count: feedback.reviews.length,
           providers: feedback.reviews.map((review) => review.provider),
           errors: feedback.errors.slice(0, 3)
@@ -963,57 +1887,130 @@ function createExternalLangGraph() {
       const dryRun = configurable.dryRun === true || state.dryRun === true;
       const geminiKey = configurable.geminiKey || process.env.GEMINI_API_KEY || "";
       const { langsmith, trace } = configurable;
+      const policy = normalizeRuntimePolicy(state.runtimePolicy);
       const hasExternalFeedback = criticFeedbackHasReviews(state.criticFeedback);
+      const shouldReviewFinal = policy.review_final_answer;
+      const reviewMode = shouldReviewFinal
+        ? hasExternalFeedback ? "external_critic_revision" : "self_review"
+        : "draft_passthrough";
       const result = await withLangSmithChild(
         langsmith,
         "LangGraph Node: agent_final",
-        hasExternalFeedback ? "llm" : "chain",
+        reviewMode === "draft_passthrough" ? "chain" : "llm",
         {
           model: GEMINI_MODEL,
           input: state.input,
           draft_chars: (state.draftAnswer || "").length,
+          review_final_answer: policy.review_final_answer,
+          review_mode: reviewMode,
           critic_feedback: summarizeCriticFeedbackForTrace(state.criticFeedback)
         },
         {
           graph_node: "agent_final",
-          ls_provider: hasExternalFeedback ? "google_genai" : "internal",
-          ls_model_name: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
+          ls_provider: reviewMode === "draft_passthrough" ? "internal" : "google_genai",
+          ls_model_name: reviewMode === "draft_passthrough" ? "draft_passthrough" : GEMINI_MODEL,
           agent_id: state.agent.agent_id,
           okf_key: state.okfKey
         },
         async () => {
-          if (!hasExternalFeedback || dryRun) {
+          if (reviewMode === "draft_passthrough" || dryRun) {
             return { raw: null, text: state.draftAnswer || buildDeterministicGraphSections(state), revised: false };
           }
           if (!geminiKey) {
             throw new Error("GEMINI_API_KEY is not available to revise the critic-reviewed draft");
           }
-          const revisionPrompt = buildGraphRevisionPrompt(state);
+          const revisionPrompt = hasExternalFeedback ? buildGraphRevisionPrompt(state) : buildGraphSelfReviewPrompt(state);
           const llmResult = await callGemini(geminiKey, revisionPrompt);
           return { ...llmResult, revised: true };
         },
         (result) => ({
-          model: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
+          model: reviewMode === "draft_passthrough" ? "draft_passthrough" : GEMINI_MODEL,
           revised: Boolean(result.revised),
           text_chars: (result.text || "").length
         })
       );
-      const finalAnswer = normalizeGraphFinalAnswer(result.text, state);
+      const normalizedFinalAnswer = normalizeGraphFinalAnswer(result.text, state);
       trace?.push(step("langgraph", "node_agent_final", {
-        model: hasExternalFeedback ? GEMINI_MODEL : "draft_passthrough",
-        revised_with_critic_feedback: Boolean(result.revised),
-        text_chars: finalAnswer.length,
-        answer: finalAnswer,
-        answer_preview: previewText(finalAnswer)
+        model: reviewMode === "draft_passthrough" ? "draft_passthrough" : GEMINI_MODEL,
+        review_final_answer: policy.review_final_answer,
+        review_mode: reviewMode,
+        revised_with_critic_feedback: Boolean(result.revised && hasExternalFeedback),
+        revised_with_self_review: Boolean(result.revised && !hasExternalFeedback && reviewMode === "self_review"),
+        finish_reason: getGeminiFinishReason(result.raw || state.llmRaw || null) || null,
+        text_chars: normalizedFinalAnswer.length,
+        answer: normalizedFinalAnswer,
+        answer_preview: previewText(normalizedFinalAnswer)
       }));
       return {
-        finalAnswer,
+        finalAnswer: normalizedFinalAnswer,
         llmRaw: result.raw || state.llmRaw || null,
-        graphEvents: [{ node: "agent_final", revised_with_critic_feedback: Boolean(result.revised), text_chars: finalAnswer.length }]
+        graphEvents: [{ node: "agent_final", revised_with_critic_feedback: Boolean(result.revised && hasExternalFeedback), revised_with_self_review: Boolean(result.revised && !hasExternalFeedback && reviewMode === "self_review"), text_chars: normalizedFinalAnswer.length }]
       };
     })
-    .addEdge(START, "load_okf")
-    .addEdge("load_okf", "context_review")
+    .addNode("output_guard", async (state, config) => {
+      const { langsmith, trace } = config.configurable || {};
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: output_guard",
+        "chain",
+        {
+          candidate_chars: String(state.finalAnswer || "").length,
+          finish_reason: getGeminiFinishReason(state.llmRaw || null) || null,
+          critic_feedback: summarizeCriticFeedbackForTrace(state.criticFeedback)
+        },
+        { graph_node: "output_guard", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => guardFinalAnswerForAgent(state.finalAnswer, state, state.llmRaw || null, config.configurable || {}),
+        (result) => ({
+          replaced: Boolean(result.replaced),
+          reasons: result.reasons || [],
+          finish_reason: result.finish_reason || null
+        })
+      );
+      trace?.push(step("langgraph", "node_output_guard", {
+        ok: true,
+        replaced: Boolean(result.replaced),
+        reasons: result.reasons || [],
+        finish_reason: result.finish_reason,
+        critic_feedback_flagged_draft: Boolean(result.critic_feedback_flagged_draft),
+        rejected_preview: result.rejected_preview || null,
+        replacement_preview: result.replacement_preview || null,
+        answer_preview: previewText(result.answer)
+      }));
+      return {
+        finalAnswer: result.answer,
+        graphEvents: [{ node: "output_guard", replaced: Boolean(result.replaced), reasons: result.reasons || [] }]
+      };
+    })
+    .addNode("output_validation", async (state, config) => {
+      const { langsmith, trace } = config.configurable || {};
+      const policy = normalizeRuntimePolicy(state.runtimePolicy);
+      const result = await withLangSmithChild(
+        langsmith,
+        "LangGraph Node: output_validation",
+        "chain",
+        { enabled: policy.output_validation, final_chars: String(state.finalAnswer || "").length },
+        { graph_node: "output_validation", agent_id: state.agent.agent_id, okf_key: state.okfKey },
+        async () => {
+          const validation = validateFinalAnswerForAgent(state.finalAnswer, state);
+          return {
+            enabled: policy.output_validation,
+            ok: policy.output_validation ? validation.ok : true,
+            reason: policy.output_validation ? validation.reason : "disabled_by_okf_runtime_policy"
+          };
+        },
+        (result) => result
+      );
+      if (!result.ok) throw new Error("OUTPUT_VALIDATION_FAILED");
+      trace?.push(step("langgraph", "node_output_validation", result));
+      return {
+        graphEvents: [{ node: "output_validation", enabled: result.enabled, ok: result.ok, reason: result.reason }]
+      };
+    })
+    .addEdge(START, "load_cam")
+    .addEdge("load_cam", "input_validation")
+    .addEdge("input_validation", "confidence_check")
+    .addConditionalEdges("confidence_check", (state) => shouldRouteToGenericLlm(state) ? "generic_llm_answer" : "context_review")
+    .addEdge("generic_llm_answer", "output_guard")
     .addEdge("context_review", "agent_plan")
     .addEdge("agent_plan", "tool_observation")
     .addEdge("tool_observation", "agent_reflection")
@@ -1023,7 +2020,9 @@ function createExternalLangGraph() {
     .addEdge("agent_synthesis", "agent_draft")
     .addEdge("agent_draft", "critic_feedback")
     .addEdge("critic_feedback", "agent_final")
-    .addEdge("agent_final", END);
+    .addEdge("agent_final", "output_guard")
+    .addConditionalEdges("output_guard", (state) => normalizeRuntimePolicy(state.runtimePolicy).output_validation ? "output_validation" : END)
+    .addEdge("output_validation", END);
 
   const checkpointer = getGraphCheckpointer();
   return checkpointer ? graphBuilder.compile({ checkpointer }) : graphBuilder.compile();
@@ -1039,9 +2038,9 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
     "LangGraph Executor: external CRUDX OKF ReAct Graph",
     "chain",
     { okf_key: okfKey, input, history_messages: messages.length, thread_id: threadId, checkpoint_backend, agent_memory_id: agentMemory?.agent_memory_id || null },
-    { graph: "crudx_okf_react_discourse", okf_key: okfKey, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_backend, agent_memory_id: agentMemory?.agent_memory_id || null, runtime_boundary: "external" },
+    { graph: "crudx_cam_react_discourse", cam_key: okfKey, okf_key: okfKey, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_backend, agent_memory_id: agentMemory?.agent_memory_id || null, runtime_boundary: "external" },
     () => graph.invoke(
-      { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {}, agentMemory: agentMemory || null },
+      { okfEnvelope, okfKey, input, messages, dryRun, metadata: metadata || {}, agentMemory: agentMemory || null, runtimePolicy: runtimePolicyFromEnvelope(okfEnvelope) },
       { configurable: { thread_id: threadId, checkpoint_ns: checkpointNs, dryRun, geminiKey: process.env.GEMINI_API_KEY || "", langsmith, trace } }
     ),
     (state) => ({
@@ -1058,12 +2057,13 @@ async function runExternalLangGraphExecutor({ okfEnvelope, okfKey, input, messag
     graphEvents: result.graphEvents || [],
     graphSummary: {
       runtime: "external-langgraph-js",
-      graph: "crudx_okf_react_discourse",
+      graph: "crudx_cam_react_discourse",
       thread_id: threadId,
       checkpoint_backend,
       checkpoint_ns: checkpointNs,
       checkpoint_inspection,
       agent_memory: agentMemory ? summarizeAgentMemoryForGraph(agentMemory) : null,
+      runtime_policy: normalizeRuntimePolicy(result.runtimePolicy || result.agent?.okf?.runtime_policy),
       nodes: (result.graphEvents || []).map((event) => event.node),
       action: result.action || "none",
       memory_profile: agentMemoryProfile(result.agent),
@@ -1079,9 +2079,11 @@ function unwrapOkfAgent(envelope, fallbackKey) {
   if (!okf || !okf.okf) {
     throw new Error(`CRUDX OKF envelope is missing okf payload: ${fallbackKey}`);
   }
+  const runtimePolicy = normalizeRuntimePolicy(okf.okf.runtime_policy || okf.runtime_policy || okf.meta?.runtime_policy);
   return {
     agent_id: okf.agent_id || okf.meta?.name || fallbackKey,
     meta: okf.meta || {},
+    runtime_policy: runtimePolicy,
     memory_profile: normalizeMemoryProfile(okf.memory_profile || okf.okf?.memory_profile || okf.meta?.memory_profile || okf.meta?.memory?.profile),
     okf: {
       system_prompt: okf.okf.system_prompt || "You are a careful ReAct agent.",
@@ -1092,10 +2094,118 @@ function unwrapOkfAgent(envelope, fallbackKey) {
         temperature: Number(okf.okf.llm?.temperature ?? 0.2)
       },
       allowed_tools: Array.isArray(okf.okf.allowed_tools) ? okf.okf.allowed_tools : [],
-      mcp_endpoints: Array.isArray(okf.okf.mcp_endpoints) ? okf.okf.mcp_endpoints : []
+      mcp_endpoints: Array.isArray(okf.okf.mcp_endpoints) ? okf.okf.mcp_endpoints : [],
+      runtime_policy: runtimePolicy
     },
     knowledge: okf.knowledge || ""
   };
+}
+
+function defaultRuntimePolicy() {
+  return {
+    input_validation: true,
+    conditional_external_ai_critique: true,
+    external_ai_critique: true,
+    review_final_answer: true,
+    output_validation: true,
+    persist_trace_run_metadata: true
+  };
+}
+
+function normalizeRuntimePolicy(rawPolicy = {}) {
+  const base = defaultRuntimePolicy();
+  const policy = rawPolicy && typeof rawPolicy === "object" ? rawPolicy : {};
+  return Object.fromEntries(
+    Object.entries(base).map(([key, fallback]) => [key, policy[key] === undefined ? fallback : policy[key] !== false])
+  );
+}
+
+function normalizeConfidenceSignalForGraph(signal, agent) {
+  if (!signal || typeof signal !== "object") {
+    return {
+      provided: false,
+      agent_id: agent?.agent_id || null,
+      route: "not_provided",
+      reason: "No confidence signal was provided by the caller."
+    };
+  }
+  const confidence = Number(signal.confidence ?? signal.confidence_score ?? signal.score);
+  const threshold = Number(signal.threshold ?? signal.confidence_threshold);
+  const bestPeer = signal.best_peer && typeof signal.best_peer === "object"
+    ? {
+        agent_id: signal.best_peer.agent_id || signal.best_peer.id || null,
+        okf_key: signal.best_peer.okf_key || signal.best_peer.okfKey || null,
+        name: signal.best_peer.name || signal.best_peer.label || null,
+        confidence: Number.isFinite(Number(signal.best_peer.confidence)) ? Number(signal.best_peer.confidence) : null
+      }
+    : null;
+  return {
+    provided: true,
+    agent_id: signal.agent_id || agent?.agent_id || null,
+    okf_key: signal.okf_key || signal.okfKey || null,
+    confidence: Number.isFinite(confidence) ? Number(confidence.toFixed(2)) : null,
+    threshold: Number.isFinite(threshold) ? Number(threshold.toFixed(2)) : null,
+    route: signal.route || signal.decision || "answer_current_agent",
+    reason: signal.reason || "",
+    best_peer: bestPeer
+  };
+}
+
+function hasPriorAssistantTurn(messages = []) {
+  return Array.isArray(messages) && messages.some((message) => String(message?.role || "").toLowerCase() === "assistant" && String(message?.content || "").trim());
+}
+
+function shouldUseGreeting(state) {
+  return false;
+}
+
+function stripAgentGreeting(answer, state) {
+  const text = String(answer || "").trim();
+  if (!text) return text;
+  const name = escapeRegex(state.agent?.meta?.name || state.agent?.agent_id || "");
+  const patterns = [
+    /^Hello,\s*I am your\s+[^.!?\n]+[.!?]\s*/i,
+    /^Hi,\s*I am your\s+[^.!?\n]+[.!?]\s*/i,
+    /^Hallo,\s*ich bin\s+[^.!?\n]+[.!?]\s*/i,
+    /^Hello,\s*I am\s+[^.!?\n]+[.!?]\s*/i
+  ];
+  if (name) {
+    patterns.unshift(new RegExp(`^Hello,\\s*I am your\\s+${name}[.!?]\\s*`, "i"));
+  }
+  let next = text;
+  for (const pattern of patterns) next = next.replace(pattern, "").trim();
+  return next || text;
+}
+
+function answerNeedsExternalCritique(state) {
+  const policy = normalizeRuntimePolicy(state.runtimePolicy);
+  if (!policy.external_ai_critique) return { run: false, reason: "disabled_by_okf_runtime_policy" };
+  if (!policy.conditional_external_ai_critique) return { run: true, reason: "always_on_by_runtime_policy" };
+
+  const signal = state.confidenceSignal || normalizeConfidenceSignalForGraph(state.metadata?.confidence_signal, state.agent);
+  if (signal?.provided && Number.isFinite(signal.confidence) && Number.isFinite(signal.threshold) && signal.confidence < signal.threshold) {
+    return { run: true, reason: "confidence_below_threshold" };
+  }
+  if (signal?.provided && /suggest_peer_agent|generic_handoff|handoff|delegate/i.test(String(signal.route || ""))) {
+    return { run: true, reason: "confidence_route_requires_handoff" };
+  }
+
+  const draft = String(state.draftAnswer || "");
+  if (answerLooksIncompleteForGuard(draft)) return { run: true, reason: "draft_incomplete_rubric" };
+  if (!isPeanoAgent(state.agent) && answerLooksLikePeanoContract(draft)) return { run: true, reason: "draft_wrong_json_contract" };
+  if (answerRecyclesIrrelevantHrCase(draft, state)) return { run: true, reason: "draft_recycles_irrelevant_context" };
+  if (isHrAgent(state.agent) && isHrCaseInput(state.input) && !/max|mustermann|vacation|urlaub|approval|balance/i.test(draft)) {
+    return { run: true, reason: "draft_missing_hr_case_terms" };
+  }
+  if (/audit|handoff|risk|escalation|final turn|approval decision|compliance|legal|medical|finance|financial/i.test(String(state.input || ""))) {
+    return { run: true, reason: "high_risk_or_audit_request" };
+  }
+  return { run: false, reason: "rubric_passed_skip_expensive_external_critic" };
+}
+
+function runtimePolicyFromEnvelope(envelope) {
+  const data = envelope && envelope.data ? envelope.data : envelope;
+  return normalizeRuntimePolicy(data?.okf?.runtime_policy || data?.runtime_policy || data?.meta?.runtime_policy);
 }
 
 function normalizeMessages(rawMessages) {
@@ -1211,6 +2321,26 @@ function selectGraphTool(input, agent) {
   if (!tools.length) return null;
   const text = String(input || "").toLowerCase();
   const dates = extractIsoDates(input);
+  const findTool = (pattern) => tools.find((tool) => pattern.test(String(tool?.name || "")));
+  if (/\b(api[- ]?calls?|endpoints?|message flows?|schnittstellenaufrufe)\b/i.test(input)) {
+    return findTool(/list_minibpmn_api_calls/i) || findTool(/api.calls/i) || tools[0];
+  }
+  if (/\b(model code|source code|modellcode|quellcode)\b/i.test(input)) {
+    return findTool(/read_minibpmn_model_code/i) || tools[0];
+  }
+  if (/\b(inspect|inspection|count|counts|tasks?|pools?|lanes?|size|struktur|anzahl)\b/i.test(input)
+      && /\b(model|minibpmn|bpmn|prozessmodell)\b/i.test(input)) {
+    return findTool(/inspect_minibpmn_model/i) || tools[0];
+  }
+  if (/\b(pid|process instance|prozessinstanz|execution status|ausf.hrungsstatus)\b/i.test(input)) {
+    return findTool(/inspect_process_pid/i) || tools[0];
+  }
+  if (/\b(cloud ?events?|associated pids?|zugeordnete pids?)\b/i.test(input)) {
+    return findTool(/list_model_cloud_events/i) || tools[0];
+  }
+  if (/\b(start|launch|ausf.hren|starte?n?)\b/i.test(input) && /\b(model|process|prozess)\b/i.test(input)) {
+    return findTool(/start_minibpmn_process/i) || tools[0];
+  }
   if (isPeanoAgent(agent) && /axiom|axioms|list|auflisten|liste/i.test(input) && !/\badd\b|addition|\bplus\b|\+|A\(/i.test(input)) {
     return null;
   }
@@ -1311,19 +2441,33 @@ function buildContextReview(input, messages, agent, agentMemory = null, metadata
 
 function buildAgentGlobalMemoryReview(agentMemory) {
   const memory = normalizeAgentMemoryDocument(agentMemory || {});
-  if (!memory.episodes.length) {
+  const relevantEpisodes = filterRelevantMemoryEpisodes(memory.episodes, memory);
+  if (!relevantEpisodes.length) {
     return "Agent-global memory: no prior persisted episodes for this agent_memory_id.";
   }
-  const episodes = memory.episodes.slice(0, 5).map((episode, index) => {
+  const episodes = relevantEpisodes.slice(0, 5).map((episode, index) => {
     const input = previewText(episode.input || "", 180);
     const answer = previewText(episode.answer || "", 220);
     return `${index + 1}. ${episode.at || "unknown time"} action=${episode.action || "none"} input="${input}" answer="${answer}"`;
   });
   return [
-    `Agent-global memory: ${memory.episodes.length} persisted episodes for ${memory.agent_memory_id}.`,
+    `Agent-global memory: ${relevantEpisodes.length} relevant persisted episodes for ${memory.agent_memory_id} (${memory.episodes.length} total).`,
     "Use this memory only when it is relevant to the current user request and do not confuse it with thread-local conversation turns.",
     ...episodes
   ].join(" ");
+}
+
+function filterRelevantMemoryEpisodes(episodes, memory) {
+  const list = Array.isArray(episodes) ? episodes : [];
+  const profile = normalizeMemoryProfile(memory?.memory_profile || "");
+  return list.filter((episode) => {
+    const text = `${episode?.input || ""}\n${episode?.answer || ""}\n${episode?.action || ""}`;
+    if (profile !== "peano_logic" && /peano_result|integer_value|Peano addition|successor recursion/i.test(text)) return false;
+    if (profile !== "location_context" && /geolocation|requestor location|browser location|coordinates|Google Maps reverse/i.test(text)) return false;
+    if (profile !== "ops_incident" && /db-prod-main|web-prod-01|vpn-gateway|checkout latency|incident handoff/i.test(text)) return false;
+    if (profile !== "academic_review" && /DOI|arXiv|citation|bibliographic|related work/i.test(text)) return false;
+    return true;
+  });
 }
 
 function buildAgentSelfContext(agent, agentMemory = null, metadata = {}) {
@@ -1369,17 +2513,26 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata 
   const tools = Array.isArray(agent?.okf?.allowed_tools) ? agent.okf.allowed_tools : [];
   const tool = tools.find((candidate) => candidate.name === action)
     || tools.find((candidate) => new RegExp(escapeRegex(action), "i").test(candidate.name || ""));
+  const contract = tool?.executorContract || tool?.executor_contract || {};
+  const isOpenApiHttp = String(contract?.type || "").toLowerCase() === "openapi_http";
   const webhookUrl = String(tool?.webhook_url || tool?.url || tool?.endpoint || "").trim();
 
   if (!isHttpUrl(webhookUrl)) {
     return buildGraphObservation(input, agent, action);
   }
 
+  const requiresConfirmation = Boolean(tool?.safety?.requires_confirmation || tool?.requires_confirmation);
+  const requestContext = metadata?.request_context || {};
+  const confirmed = requestContext.confirmed === true || requestContext.user_confirmed === true || requestContext.confirm === true;
+  if (requiresConfirmation && !confirmed) {
+    return `The selected operation ${tool?.name || action} changes process runtime state and requires explicit confirmation before it can be executed.`;
+  }
+
   const fallback = buildGraphObservation(input, agent, action);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
   const parameters = inferToolParameters(input, tool, agent, metadata?.messages || []);
-  if (metadata?.request_context) parameters.request_context = metadata.request_context;
+  applyModelApiContext(parameters, tool, requestContext);
   const payload = {
     tool: tool.name || action,
     query: input,
@@ -1396,11 +2549,14 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata 
   };
 
   const callWebhook = async () => {
-    const response = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const request = isOpenApiHttp
+      ? buildOpenApiHttpRequest(tool, contract, parameters)
+      : { url: webhookUrl, method: "POST", body: payload };
+    const response = await fetch(request.url, {
+      method: request.method,
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify(payload)
+      ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) })
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body.ok === false) {
@@ -1428,6 +2584,7 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata 
       {
         tool: tool.name || action,
         webhook_url: webhookUrl,
+        method: isOpenApiHttp ? String(contract.method || tool?.method || "GET").toUpperCase() : "POST",
         okf_key: okfKey || null,
         agent_id: agent?.agent_id || null,
         parameters: payload.parameters,
@@ -1455,6 +2612,39 @@ async function executeOkfTool(input, agent, action, okfKey, langsmith, metadata 
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function applyModelApiContext(parameters, tool, requestContext = {}) {
+  const defaults = tool?.defaults && typeof tool.defaults === "object" ? tool.defaults : {};
+  for (const [key, value] of Object.entries(defaults)) {
+    if ((parameters[key] === undefined || parameters[key] === "") && value !== undefined && value !== null && value !== "") parameters[key] = value;
+  }
+  const modelKey = requestContext.process_model_crudx_id || requestContext.processModelKey || requestContext.modelKey || requestContext.model_key;
+  const pid = requestContext.pid || requestContext.PID || requestContext.process_id;
+  if (!parameters.key && modelKey) parameters.key = modelKey;
+  if (!parameters.modelKey && modelKey) parameters.modelKey = modelKey;
+  if (!parameters.pid && pid) parameters.pid = pid;
+}
+
+function buildOpenApiHttpRequest(tool, contract, parameters) {
+  const method = String(contract.method || tool?.method || "GET").toUpperCase();
+  const base = String(contract.serverUrl || contract.server_url || "").replace(/\/$/, "");
+  let path = String(contract.path || "");
+  const consumed = new Set();
+  path = path.replace(/\{([^}]+)\}/g, (match, name) => {
+    const value = parameters[name];
+    if (value === undefined || value === null || value === "") throw new Error(`Missing required OpenAPI path parameter: ${name}`);
+    consumed.add(name);
+    return encodeURIComponent(String(value));
+  });
+  let url = base && path ? `${base}${path.startsWith("/") ? "" : "/"}${path}` : String(tool?.webhook_url || tool?.url || "");
+  const args = Object.fromEntries(Object.entries(parameters).filter(([key, value]) => key !== "query" && !consumed.has(key) && value !== undefined && value !== null && value !== ""));
+  if (["GET", "DELETE", "HEAD"].includes(method)) {
+    const parsed = new URL(url);
+    for (const [key, value] of Object.entries(args)) parsed.searchParams.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+    return { url: parsed.toString(), method };
+  }
+  return { url, method, body: args };
 }
 
 async function executeNamedOkfTool(input, agent, preferredName, okfKey, fallbackFactory, langsmith, metadata = {}) {
@@ -1504,6 +2694,9 @@ function shouldRunToolForInput(tool, input, agent) {
   const description = String(tool?.description || "").toLowerCase();
   const text = String(input || "").toLowerCase();
   const haystack = `${name} ${description}`;
+  if (/minibpmn|process.pid|model.api.calls|cloud.events/.test(haystack)) {
+    return /minibpmn|bpmn|process model|prozessmodell|api.calls?|endpoints?|message flows?|cloud.events?|\bpid\b|process instance/i.test(input);
+  }
   if (/calculate|calendar|date|days|business/.test(haystack)) {
     return extractIsoDates(input).length >= 2
       || /\b(from\s+20\d{2}-\d{2}-\d{2}|between\s+20\d{2}-\d{2}-\d{2}|business day|business days|calendar|date range|dated period|period from|start date|end date)\b/i.test(input);
@@ -1527,6 +2720,9 @@ function inferToolParameters(input, tool, agent, messages = []) {
   const name = String(tool?.name || "").toLowerCase();
   const dates = extractIsoDates(input);
   const params = { query: String(input || "") };
+  const crudxIds = String(input || "").match(/CRUDX-[A-Z0-9-]+/gi) || [];
+  if (/minibpmn|model/.test(name) && crudxIds.length) params.key = crudxIds[0].toUpperCase();
+  if (/process.pid|pid/.test(name) && crudxIds.length) params.pid = crudxIds[0].toUpperCase();
   if (/peano|add/.test(name)) {
     const operands = inferNaturalOperands(input, messages);
     if (operands) {
@@ -1613,6 +2809,10 @@ function normalizeToolObservation(body, fallback) {
   }
   if (body.business_days !== undefined && body.start_date && body.end_date) {
     return `Calculated business-day impact for ${body.start_date} to ${body.end_date} is ${body.business_days} business days.`;
+  }
+  if (body && typeof body === "object" && Object.keys(body).length) {
+    const serialized = JSON.stringify(body);
+    return serialized.length > 24000 ? `${serialized.slice(0, 24000)}…` : serialized;
   }
   return fallback;
 }
@@ -1832,6 +3032,9 @@ function buildGraphFinalPrompt(state) {
       ? "The current user input is an agent self-knowledge question. Answer from the Agent self model in normal prose, even if the domain OKF usually requires JSON."
       : "",
     state.agent.okf.system_prompt,
+    shouldAnswerInEnglish(state)
+      ? "Language guard: The application language for this agent is English. Answer in English even when the user writes in German. If the user wrote in German, briefly apologize and include an English translation of the received question before answering."
+      : "",
     academicRequirements,
     opsRequirements,
     locationRequirements,
@@ -1844,6 +3047,9 @@ function buildGraphFinalPrompt(state) {
       : "Do not output JSON, Markdown code fences, raw graph state, trace data, or hidden chain-of-thought.",
     "Do not use headings named Plan, Dialogue, Evidence, or Final.",
     "Write like a helpful professional assistant speaking to the user.",
+    shouldUseGreeting(state)
+      ? "Do not greet or introduce yourself in the answer. The UI already shows the agent profile card."
+      : "Do not greet or introduce yourself in the answer. Continue the conversation directly; repeated 'Hello, I am your ...' introductions make the agent look stateless.",
     "Mention missing information only when it materially affects the answer.",
     "Default brevity rule: keep normal answers under 120 words and usually 2-4 sentences.",
     "Exceed 120 words only when the user explicitly asks for an audit, handoff, detailed comparison, long analysis, or structured report.",
@@ -1890,6 +3096,9 @@ function buildGraphRevisionPrompt(state) {
   const requiresJson = agentRequiresJsonOutput(state.agent) && !isAgentSelfQuestion(state.input);
   return [
     state.agent.okf.system_prompt,
+    shouldAnswerInEnglish(state)
+      ? "Language guard: Return the final answer in English. If the draft or critic feedback is German, translate or rewrite it into English before returning it."
+      : "",
     "",
     "You are the final revision node in a LangGraph ReAct executor.",
     "You have a draft answer and independent AI critic feedback.",
@@ -1933,6 +3142,45 @@ function buildGraphRevisionPrompt(state) {
     "- If critics ask for structure, missing-evidence separation, less verbosity, or clearer caveats, implement those changes.",
     "- Do not keep the draft unchanged unless every critic suggestion is unsupported or harmful.",
     "- Remove redundant explanation and platform/process wording before returning the final answer."
+  ].filter(Boolean).join("\n");
+}
+
+function buildGraphSelfReviewPrompt(state) {
+  const requiresJson = agentRequiresJsonOutput(state.agent) && !isAgentSelfQuestion(state.input);
+  return [
+    state.agent.okf.system_prompt,
+    shouldAnswerInEnglish(state)
+      ? "Language guard: Return the improved final answer in English."
+      : "",
+    "",
+    "You are the final self-review node in a LangGraph ReAct executor.",
+    "Use the same provider model to quickly improve the draft without calling an external critic.",
+    "Keep the answer simple, short, grounded, and user-facing.",
+    "Check these points before returning:",
+    "- Answer the user's latest question directly.",
+    "- Use simple language.",
+    "- Be brief.",
+    "- Do not hallucinate facts not supported by the graph state, OKF knowledge, tool observations, or prior conversation.",
+    "- Remove platform/process wording unless the user explicitly asks about the platform.",
+    requiresJson
+      ? "Honor the OKF output format exactly. Return a valid JSON object only, with no Markdown code fence, no prose, and no extra fields unless the OKF schema explicitly allows them."
+      : "Return only the final user-facing answer. Do not output JSON, Markdown code fences, trace data, or hidden chain-of-thought.",
+    "",
+    `Current user input: ${state.input}`,
+    "",
+    "Graph synthesis:",
+    state.synthesis || "none",
+    "",
+    "Tool observations:",
+    [
+      state.observation || "",
+      formatFollowupObservations(state.followupObservations)
+    ].filter(Boolean).join("\n") || "none",
+    "",
+    "Draft answer:",
+    state.draftAnswer || "none",
+    "",
+    "Return the improved final answer now."
   ].filter(Boolean).join("\n");
 }
 
@@ -2171,6 +3419,266 @@ function summarizeCriticFeedbackForTrace(feedback) {
   };
 }
 
+function getGeminiFinishReason(raw) {
+  return String(raw?.candidates?.[0]?.finishReason || raw?.candidates?.[0]?.finish_reason || "").trim();
+}
+
+function answerLooksLikePeanoContract(value) {
+  return /"peano_result"\s*:|"integer_value"\s*:|Peano addition result|successor recursion/i.test(String(value || ""));
+}
+
+function answerLooksLikeLocationFallback(value) {
+  return /requestor location|browser geolocation|explicit coordinates|reverse geocoding|Google Maps|For greater precision/i.test(String(value || ""));
+}
+
+function answerLooksIncompleteForGuard(value) {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (text.length < 25) return true;
+  return !/[.!?)]$/.test(text) || /(?:\band|\bor|\bwith|,\s*)$/i.test(text);
+}
+
+function isHrCaseInput(value) {
+  return /mustermann|sandra|schreiber|vacation|urlaub|approval|balance|remaining days|business.?day|coverage|absence|manager|holiday calendar/i.test(String(value || ""));
+}
+
+function isRuntimeClockQuestion(value) {
+  return /what\s+(day|date|time)|current\s+(day|date|time)|wie\s+sp.t|welcher\s+tag|datum|uhrzeit/i.test(String(value || ""));
+}
+
+function currentAgentCanAnswer(state) {
+  const input = String(state.input || "");
+  if (!input.trim()) return true;
+  if (isAgentSelfQuestion(input)) return true;
+  if (isRuntimeClockQuestion(input)) return false;
+  if (isHrAgent(state.agent)) return isHrCaseInput(input);
+  if (isPeanoAgent(state.agent)) return /add|plus|integer|peano|arithmetic|recursion|axiom|sum|\d+\s*\+\s*\d+/i.test(input);
+  if (isLocationAgent(state.agent)) return /where am i|where are you|where is|location|located|geolocation|maps|route|wo bin ich|wo bist du|standort/i.test(input);
+  if (isAcademicAgent(state.agent)) return /paper|research|citation|academic|doi|arxiv|bibliography|transformer|attention|study|literature/i.test(input);
+  if (isOpsAgent(state.agent)) return /server|sysadmin|incident|latency|database|checkout|vpn|degraded|risk|mitigation|handoff|ops/i.test(input);
+  return true;
+}
+
+function shouldRouteToGenericLlm(state) {
+  const signal = state.confidenceSignal || normalizeConfidenceSignalForGraph(state.metadata?.confidence_signal, state.agent);
+  const input = String(state.input || "");
+  if (isAgentSelfQuestion(input)) return false;
+  if (isRuntimeClockQuestion(input)) return true;
+  if (signal?.provided) {
+    const route = String(signal.route || "");
+    if (/generic_handoff|generic_llm|open_domain|direct_llm/i.test(route)) return true;
+    if (/suggest_peer_agent|handoff|delegate/i.test(route)) return true;
+    if (Number.isFinite(signal.confidence) && Number.isFinite(signal.threshold) && signal.confidence < signal.threshold) return true;
+  }
+  return !currentAgentCanAnswer(state);
+}
+
+function buildGenericFallbackPrompt(state) {
+  const requestContext = state.metadata?.request_context || {};
+  const englishRequired = shouldAnswerInEnglish(state);
+  const runtimeClock = {
+    utc_iso: new Date().toISOString(),
+    server_time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+  };
+  return [
+    "You are a generic fallback language model inside the ReAct AaaS platform.",
+    "The active specialist agent is not the right source for the user's latest question.",
+    englishRequired
+      ? "Answer in English, even if the user wrote in German or another language."
+      : "Answer the latest user question directly in the user's language.",
+    englishRequired && looksGermanLanguage(state.input)
+      ? "The user question appears to be German. Start with one brief apology and an English translation of the received question, then answer in English."
+      : "",
+    "Do not pretend to be the specialist agent. Do not mention internal LangGraph nodes, OKF, or routing unless the user asks about implementation.",
+    "Do not open with a greeting or self-introduction.",
+    "If the question asks for current time/date and clock context is available, use it.",
+    "If the question requires current external facts you cannot verify from the supplied context, say what is known generally and note the limitation briefly.",
+    "",
+    "Runtime/request context:",
+    JSON.stringify(requestContext).slice(0, 1200),
+    "Runtime/server clock:",
+    JSON.stringify(runtimeClock),
+    "",
+    "Prior conversation:",
+    buildConversationContext(state.messages || []),
+    "",
+    `Latest user question: ${state.input}`
+  ].join("\n");
+}
+
+function answerRecyclesIrrelevantHrCase(answer, state) {
+  if (!isHrAgent(state.agent)) return false;
+  if (isHrCaseInput(state.input)) return false;
+  const text = String(answer || "");
+  const subjectMatch = String(state.input || "").match(/(?:wer war|wer ist|who was|who is)\s+([^?.!]+)/i);
+  const subject = subjectMatch ? subjectMatch[1].trim() : "";
+  if (subject && new RegExp(escapeRegex(subject), "i").test(text) && !/mustermann|sandra|schreiber/i.test(text)) return false;
+  return /mustermann|sandra|schreiber|remaining vacation days|annual entitlement|coverage plan/i.test(text);
+}
+
+function buildScopedMissingInfoAnswer(state) {
+  const input = String(state.input || "").trim();
+  const agentName = state.agent?.meta?.name || state.agent?.agent_id || "this agent";
+  const subjectMatch = input.match(/(?:wer war|wer ist|who was|who is)\s+([^?.!]+)/i);
+  const subject = subjectMatch ? subjectMatch[1].trim() : "";
+  if (isHrAgent(state.agent)) {
+    return subject
+      ? `I do not have reliable information about ${subject} in my HR records. If this is an employee or an HR case, please provide the employee context; otherwise this should be answered by a general knowledge agent.`
+      : `I do not have reliable HR records for that question. Please provide employee or case context, or use a general knowledge agent for non-HR topics.`;
+  }
+  return `I do not have enough reliable information in ${agentName}'s configured records to answer that safely.`;
+}
+
+function criticFeedbackSignalsBrokenAnswer(feedback) {
+  const text = [
+    feedback?.summary || "",
+    ...(Array.isArray(feedback?.reviews) ? feedback.reviews.map((review) => review.text || "") : [])
+  ].join("\n");
+  if (!text.trim()) return false;
+  if (/\*\*score_1_to_10\*\*\s*:\s*([0-4])\b/i.test(text)) return true;
+  return /wrong domain|irrelevant|does not answer|fails to address|Peano arithmetic response instead of HR|incorrectly routes/i.test(text);
+}
+
+async function guardFinalAnswerForAgent(answer, state, raw, configurable = {}) {
+  const original = String(answer || "").trim();
+  const reasons = [];
+  const finishReason = getGeminiFinishReason(raw);
+  const agent = state.agent || {};
+
+  if (finishReason === "MAX_TOKENS" && answerLooksIncompleteForGuard(original)) reasons.push("llm_finish_reason_max_tokens_incomplete_answer");
+  if (!isPeanoAgent(agent) && answerLooksLikePeanoContract(original)) reasons.push("non_peano_agent_returned_peano_contract");
+  if (!isLocationAgent(agent) && answerLooksLikeLocationFallback(original)) reasons.push("non_location_agent_returned_location_fallback");
+  if (answerRecyclesIrrelevantHrCase(original, state)) reasons.push("answer_recycles_irrelevant_hr_case");
+  if (isHrAgent(agent) && isHrCaseInput(state.input)) {
+    if (!/max|mustermann|vacation|urlaub|approval|balance/i.test(original)) reasons.push("hr_answer_missing_hr_case_terms");
+  }
+
+  const uniqueReasons = Array.from(new Set(reasons));
+  if (!uniqueReasons.length) {
+    const languageGuard = await enforceConfiguredAnswerLanguage(original, state, configurable);
+    return {
+      answer: languageGuard.answer,
+      replaced: languageGuard.replaced,
+      reasons: languageGuard.reasons,
+      finish_reason: finishReason || null,
+      critic_feedback_flagged_draft: criticFeedbackSignalsBrokenAnswer(state.criticFeedback),
+      language_guard: languageGuard
+    };
+  }
+
+  const replacement = uniqueReasons.includes("answer_recycles_irrelevant_hr_case")
+    ? buildScopedMissingInfoAnswer(state)
+    : buildDeterministicGraphSections(state);
+  const languageGuard = await enforceConfiguredAnswerLanguage(replacement, state, configurable);
+  return {
+    answer: languageGuard.answer,
+    replaced: replacement !== original || languageGuard.replaced,
+    reasons: Array.from(new Set([...uniqueReasons, ...languageGuard.reasons])),
+    finish_reason: finishReason || null,
+    critic_feedback_flagged_draft: criticFeedbackSignalsBrokenAnswer(state.criticFeedback),
+    rejected_preview: previewText(original),
+    replacement_preview: previewText(languageGuard.answer),
+    language_guard: languageGuard
+  };
+}
+
+function shouldAnswerInEnglish(state) {
+  const prompt = String(state?.agent?.okf?.system_prompt || "");
+  return /answer in english|reply in english|always reply in english|application language is english/i.test(prompt);
+}
+
+function looksGermanLanguage(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text.trim()) return false;
+  const markers = [
+    " der ", " die ", " das ", " und ", " oder ", " bitte ", " nicht ", " ich ", " du ", " sie ",
+    "eine ", "einen ", "einem ", "für ", "über ", "können", "müssen", "benötigt", "frage", "antwort",
+    "geschäftsziel", "zielumgebung", "aktueller zustand", "architektur", "erstellen"
+  ];
+  const markerCount = markers.filter((marker) => text.includes(marker)).length;
+  const umlautCount = (text.match(/[äöüß]/g) || []).length;
+  return umlautCount >= 1 || markerCount >= 2;
+}
+
+async function enforceConfiguredAnswerLanguage(answer, state, configurable = {}) {
+  const original = String(answer || "").trim();
+  if (!original || !shouldAnswerInEnglish(state) || agentRequiresJsonOutput(state.agent)) {
+    return { answer: original, replaced: false, reasons: [], target_language: "unchanged" };
+  }
+  if (!looksGermanLanguage(original)) {
+    return { answer: original, replaced: false, reasons: [], target_language: "English" };
+  }
+  const geminiKey = configurable.geminiKey || process.env.GEMINI_API_KEY || "";
+  if (!geminiKey) {
+    return {
+      answer: original,
+      replaced: false,
+      reasons: ["answer_language_not_english_no_rewrite_key"],
+      target_language: "English"
+    };
+  }
+  const prompt = [
+    "Rewrite the assistant answer into English.",
+    "Preserve facts, numbers, names, CRUDX IDs, URLs, and the answer intent.",
+    "Do not add Markdown code fences, trace data, hidden reasoning, or implementation notes.",
+    "Do not add a greeting or self-introduction.",
+    looksGermanLanguage(state.input)
+      ? `The user's question was German. Add one short apology and this English translation of the question before the answer: "${translateGermanQuestionForHeader(state.input)}".`
+      : "",
+    "",
+    "Assistant answer to rewrite:",
+    original
+  ].filter(Boolean).join("\n");
+  try {
+    const result = await callGemini(geminiKey, prompt);
+    const rewritten = normalizeGraphFinalAnswer(result.text, state);
+    return {
+      answer: rewritten || original,
+      replaced: Boolean(rewritten && rewritten !== original),
+      reasons: ["answer_language_not_english_rewritten"],
+      target_language: "English"
+    };
+  } catch (error) {
+    return {
+      answer: original,
+      replaced: false,
+      reasons: ["answer_language_not_english_rewrite_failed"],
+      target_language: "English",
+      error: error.message || String(error)
+    };
+  }
+}
+
+function translateGermanQuestionForHeader(value) {
+  const text = String(value || "").trim();
+  const known = [
+    [/^ask me the missing questions before generating the architecture vision\.?$/i, "Ask me the missing questions before generating the Architecture Vision."],
+    [/fehlenden fragen|fehlende fragen|fehlenden informationen/i, "Ask me the missing questions before generating the Architecture Vision."],
+    [/architecture vision|architekturvision/i, "Ask me the missing questions before generating the Architecture Vision."]
+  ];
+  const match = known.find(([pattern]) => pattern.test(text));
+  return match ? match[1] : text;
+}
+
+function validateFinalAnswerForAgent(answer, state) {
+  const value = String(answer || "").trim();
+  if (!value) return { ok: false, reason: "final_answer_missing" };
+  const agent = state.agent || {};
+  if (!isPeanoAgent(agent) && answerLooksLikePeanoContract(value)) {
+    return { ok: false, reason: "non_peano_agent_returned_peano_contract" };
+  }
+  if (!isLocationAgent(agent) && answerLooksLikeLocationFallback(value)) {
+    return { ok: false, reason: "non_location_agent_returned_location_fallback" };
+  }
+  if (answerRecyclesIrrelevantHrCase(value, state)) {
+    return { ok: false, reason: "answer_recycles_irrelevant_hr_case" };
+  }
+  if (isHrAgent(agent) && isHrCaseInput(state.input) && !/max|mustermann|vacation|urlaub|approval|balance/i.test(value)) {
+    return { ok: false, reason: "hr_answer_missing_hr_case_terms" };
+  }
+  return { ok: true, reason: "final_answer_domain_safe" };
+}
+
 function normalizeGraphFinalAnswer(text, state) {
   const raw = String(text || "").trim();
   const withoutFences = raw.replace(/^```(?:json|markdown|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
@@ -2195,33 +3703,34 @@ function normalizeGraphFinalAnswer(text, state) {
     return buildDeterministicGraphSections(state);
   }
   const answer = looksIncomplete || looksDebuggy ? buildDeterministicGraphSections(state) : withoutFences;
-  if (isAgentSelfQuestion(state.input)) return answer;
-  return humanizeUserFacingPlatformLanguage(answer);
+  const withoutGreeting = stripAgentGreeting(answer, state);
+  if (isAgentSelfQuestion(state.input)) return withoutGreeting;
+  return humanizeUserFacingPlatformLanguage(withoutGreeting);
 }
 
 function buildAgentSelfAnswer(state) {
   const memory = normalizeAgentMemoryDocument(state.agentMemory || {});
   const metadata = state.metadata || {};
   const meta = state.agent?.meta || {};
-  const name = meta.name || state.agent?.agent_id || "dieser Agent";
+  const name = meta.name || state.agent?.agent_id || "this agent";
   const okfKey = memory.okf_key || metadata.okf_key || metadata.okfKey || "-";
   const openApiKey = metadata.openapi_key || metadata.openApiKey || metadata.openapiKey || meta.openapi_key || "-";
   const memoryId = memory.agent_memory_id || metadata.agent_memory_id || "-";
   const text = String(state.input || "");
   if (/benutzen|verwenden|use|openapi/i.test(text)) {
-    return `Du kannst mich über mein OpenAPI-Artefakt ${openApiKey} benutzen. Meine fachliche Grundlage ist das OKF ${okfKey}; in dieser Umgebung kannst du mir direkt Fragen stellen oder die OpenAPI-App öffnen, um meine Operationen und Testaufrufe zu sehen.`;
+    return `You can use me through my OpenAPI artifact ${openApiKey}. My professional basis is the OKF ${okfKey}; in this environment you can ask me directly or open the OpenAPI app to inspect my operations and test calls.`;
   }
   if (/gelernt|memory|ged[aä]chtnis|inspect|inspizieren/i.test(text)) {
-    return `Mein Agenten-Gedächtnis hat die ID ${memoryId}. Es enthält aktuell ${memory.episodes.length} persistierte Episode(n) aus ${memory.run_count || memory.episodes.length} Lauf/Läufen und kann nach einem Lauf über die Agent-Memory-Pill inspiziert werden.`;
+    return `My agent memory ID is ${memoryId}. It currently contains ${memory.episodes.length} persisted episode(s) from ${memory.run_count || memory.episodes.length} run(s), and you can inspect it after a run through the Agent Memory pill.`;
   }
   if (/h[aä]ufig|often|frequent|meist/i.test(text)) {
     const counts = new Map();
     for (const episode of memory.episodes || []) counts.set(episode.action || "none", (counts.get(episode.action || "none") || 0) + 1);
     const top = Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0];
-    return `Ich wurde in diesem agent-globalen Gedächtnis bisher ${memory.run_count || memory.episodes.length} Mal persistiert. Am häufigsten sehe ich aktuell ${top ? `${top[0]} (${top[1]} Mal)` : "noch kein wiederkehrendes Muster"}.`;
+    return `I have been persisted ${memory.run_count || memory.episodes.length} time(s) in this agent-global memory. The most frequent pattern I currently see is ${top ? `${top[0]} (${top[1]} time(s))` : "no recurring pattern yet"}.`;
   }
   const creator = meta.created_by || meta.creator || meta.author || meta.owner || meta.maintainer || "";
-  return `Ich bin ${name}. Meine Grundlage ist mein konstituierendes OKF ${okfKey}; darüber sind Rolle, Werkzeuge, Wissen und Antwortregeln definiert. ${creator ? `Konfiguriert wurde ich von ${creator}. ` : "Ein konkreter Ersteller ist in meinen OKF-Metadaten nicht angegeben. "}Mein OpenAPI-Artefakt ist ${openApiKey}, und mein Agenten-Gedächtnis hat die ID ${memoryId}.`;
+  return `I am ${name}. My foundation is my constituting OKF ${okfKey}; it defines my role, capabilities, knowledge, and answer rules. ${creator ? `I was configured by ${creator}. ` : "No concrete creator is listed in my OKF metadata. "}My OpenAPI artifact is ${openApiKey}, and my agent memory ID is ${memoryId}.`;
 }
 
 function humanizeUserFacingPlatformLanguage(value) {
@@ -2324,7 +3833,6 @@ function isPeanoAgent(agent) {
     agent?.agent_id,
     agent?.meta?.id,
     agent?.meta?.name,
-    agent?.okf?.system_prompt,
     (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
   ].join("\n");
   return /peano|math-peano-core|peano_addition/i.test(haystack);
@@ -2336,7 +3844,6 @@ function isLocationAgent(agent) {
     agent?.agent_id,
     agent?.meta?.id,
     agent?.meta?.name,
-    agent?.okf?.system_prompt,
     (agent?.okf?.allowed_tools || []).map((tool) => tool.name).join(" ")
   ].join("\n");
   return /requestor.location|requester.location|requestor-location|requestor_location|standort|geo/i.test(haystack);
@@ -2369,7 +3876,7 @@ function legacyIsAcademicAgent(agent) {
     agent?.agent_id,
     agent?.meta?.id,
     agent?.meta?.name,
-    agent?.okf?.system_prompt,
+    Array.isArray(agent?.meta?.tags) ? agent.meta.tags.join(" ") : "",
     (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
   ].join("\n");
   return /academic-research|academic research|literature review|research assistant|paper analysis|citation/i.test(haystack);
@@ -2382,8 +3889,6 @@ function isOpsAgent(agent) {
     agent?.meta?.id,
     agent?.meta?.name,
     Array.isArray(agent?.meta?.tags) ? agent.meta.tags.join(" ") : "",
-    agent?.okf?.system_prompt,
-    agent?.knowledge,
     (agent?.okf?.allowed_tools || []).map((tool) => `${tool.name} ${tool.description || ""}`).join(" ")
   ].join("\n");
   return /sysadmin|ops|incident|infrastructure|db-prod-main|web-prod-01|vpn-gateway|server status|check_server_status/i.test(haystack);
@@ -2409,7 +3914,7 @@ function agentMemoryProfile(agent, options = {}) {
 
 function normalizeMemoryProfile(value) {
   const profile = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
-  return ["hr_case", "academic_review", "ops_incident", "location_context", "peano_logic", "generic"].includes(profile)
+  return ["hr_case", "academic_review", "ops_incident", "location_context", "peano_logic", "togaf_phase_a", "generic"].includes(profile)
     ? profile
     : "";
 }
@@ -2977,7 +4482,7 @@ async function callGemini(apiKey, prompt) {
     },
     body: JSON.stringify({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 900 }
+      generationConfig: { temperature: 0.2, maxOutputTokens: 1600 }
     })
   });
   const body = await response.json().catch(() => ({}));
@@ -2987,7 +4492,15 @@ async function callGemini(apiKey, prompt) {
   return { raw: body, text };
 }
 
-function createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata = {} }) {
+function createLangSmithTrace({ runKey, input, okfKey, dryRun, threadId, metadata = {}, runtimePolicy = defaultRuntimePolicy() }) {
+  if (normalizeRuntimePolicy(runtimePolicy).persist_trace_run_metadata === false) {
+    return {
+      enabled: false,
+      reason: "LangSmith trace/run metadata persistence is disabled by OKF runtime_policy.",
+      errors: [],
+      disabled_by_policy: true
+    };
+  }
   const apiKey = process.env.LANGSMITH_API_KEY || "";
   if (!apiKey) return { enabled: false, reason: "LANGSMITH_API_KEY not configured", errors: [] };
   try {
@@ -3035,8 +4548,9 @@ async function ensureLangSmithProject(langsmith) {
       metadata: { app: "crudx-react-aaas", runtime: "external-langgraph" },
       upsert: true
     });
-    langsmith.projectId = project?.id || null;
+    langsmith.projectId = project?.id || LANGSMITH_PROJECT_ID || null;
   } catch (error) {
+    langsmith.projectId = langsmith.projectId || LANGSMITH_PROJECT_ID || null;
     rememberLangSmithError(langsmith, `project_upsert: ${error.message || error}`);
   }
 }
@@ -3057,7 +4571,7 @@ async function postLangGraphSpans(langsmith, graphResult, trace) {
 
   await withLangSmithChild(
     langsmith,
-    "LangGraph Executor: external crudx_okf_react_discourse",
+    "LangGraph Executor: external crudx_cam_react_discourse",
     "chain",
     { runtime: summary.runtime, graph: summary.graph, thread_id: summary.thread_id, nodes: events.map((event) => event.node), action: summary.action || "none" },
     { graph: summary.graph, runtime: summary.runtime, thread_id: summary.thread_id, span_source: "external_graph_event_mirror" },
@@ -3067,7 +4581,7 @@ async function postLangGraphSpans(langsmith, graphResult, trace) {
 
   for (const event of events) {
     const node = String(event?.node || "unknown_node");
-    const runType = node === "agent_final" || node === "agent_draft" ? "llm" : node.startsWith("tool_") ? "tool" : node === "load_okf" ? "retriever" : "chain";
+    const runType = node === "agent_final" || node === "agent_draft" ? "llm" : node.startsWith("tool_") ? "tool" : node === "load_cam" ? "retriever" : "chain";
     await withLangSmithChild(
       langsmith,
       `LangGraph Node: ${node}`,
@@ -3132,9 +4646,11 @@ async function resolveLangSmithUrls(langsmith) {
   const runId = langsmith.root.id;
   langsmith.runId = runId;
   langsmith.traceId = langsmith.root.trace_id || runId;
-  if (langsmith.workspaceId && langsmith.projectId && runId) {
+  const workspaceId = langsmith.workspaceId || LANGSMITH_WORKSPACE_ID;
+  const projectId = langsmith.projectId || LANGSMITH_PROJECT_ID;
+  if (workspaceId && projectId && runId) {
     const base = "https://smith.langchain.com";
-    langsmith.projectUrl = `${base}/o/${langsmith.workspaceId}/projects/p/${langsmith.projectId}`;
+    langsmith.projectUrl = `${base}/o/${workspaceId}/projects/p/${projectId}`;
     langsmith.runUrl = `${langsmith.projectUrl}/r/${runId}?trace_id=${langsmith.traceId}`;
   }
 }
@@ -3171,10 +4687,19 @@ function stableRunId(okfKey, input) {
   return crypto.createHash("sha256").update(`${okfKey}:${input}:${Date.now()}`).digest("hex").slice(0, 32);
 }
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+function setCors(res, req) {
+  const origin = req?.headers?.origin;
+  const requestedHeaders = req?.headers?.["access-control-request-headers"];
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Method");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    requestedHeaders || "Content-Type, Authorization, X-API-Key, X-LangGraph-API-Key, X-LangSmith-API-Key"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Type, Content-Location, X-Request-Id, X-Pagination-Next");
 }
 
 function sendJson(res, status, body) {
@@ -3182,12 +4707,13 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function writeSseHeaders(res) {
+function writeSseHeaders(res, extraHeaders = {}) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    "X-Accel-Buffering": "no"
+    "X-Accel-Buffering": "no",
+    ...extraHeaders
   });
   res.write(": connected\n\n");
 }
