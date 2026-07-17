@@ -8,7 +8,8 @@
     "node": "20"
   },
   "scripts": {
-    "lint": "node --check index.external.js",
+    "lint": "node --check index.external.js && node --check help-route.js",
+    "test": "node --test test/*.test.js",
     "deploy": "firebase deploy --only functions --project crudx-e0599",
     "serve": "firebase emulators:start --only functions --project crudx-e0599"
   },

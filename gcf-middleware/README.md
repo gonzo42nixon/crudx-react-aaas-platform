@@ -21,6 +21,19 @@ Externe LangGraph Runtime
 
 Der Firebase Functions Entry ist `functions/index.external.js`. Ohne gesetztes `LANGGRAPH_RUNTIME_URL` antwortet `reactAaasInvoke` absichtlich mit `LANGGRAPH_RUNTIME_URL_REQUIRED`; es gibt keinen stillen Fallback auf embedded LangGraph.
 
+## Deterministische CAM-Hilfe
+
+Die reservierte Eingabe `?` wird zentral in `reactAaasInvoke` und `reactAaasStream` verarbeitet. Die Middleware liest das aktive CAM und erzeugt daraus eine Markdown-Antwort mit Agentenname, Zweck, konfigurierten Beispielfragen und Help-Link.
+
+Diese Route ist absichtlich nebenwirkungsfrei:
+
+- kein LangGraph-Lauf;
+- kein LLM-Aufruf;
+- keine Tool-Ausfuehrung;
+- kein persistiertes Run-Dokument.
+
+Ein CAM aktiviert die Route durch `help_command.input: "?"`. Seine `example_prompts` sollten `?` als ersten Eintrag enthalten; der Literalwert wird in der ausgegebenen nummerierten Beispielliste nicht wiederholt. Die Implementierung liegt in `functions/help-route.js` und wird auch dann ausgefuehrt, wenn die externe LangGraph Runtime voruebergehend nicht konfiguriert oder erreichbar ist.
+
 Erforderliche GCF-Parameter:
 
 ```text
@@ -34,6 +47,7 @@ LANGGRAPH_RUNTIME_TOKEN=<optional bearer token>
 ## Enthalten
 
 - `functions/index.external.js`: HTTPS Function `reactAaasInvoke` als Middleware fuer externe LangGraph Runtime
+- `functions/help-route.js`: deterministische, nebenwirkungsfreie `?`-Route aus dem aktiven CAM
 - `functions/package.json`: Node.js 20 Firebase Functions Dependencies inkl. LangSmith SDK
 - `firebase.json`: deploybare Firebase-Functions-Konfiguration
 - `test-payloads/invoke-dry-run.json`: CRUDX-ID-konformes Testpayload

@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
+const { buildCamHelp, isHelpRequest } = require("./help-route");
 
 const REGION = "europe-west3";
 const CRUDX_DOCS_API = defineString("CRUDX_DOCS_API", {
@@ -82,21 +83,46 @@ exports.reactAaasInvoke = onRequest(
       return;
     }
 
-    if (!runtimeUrl) {
-      res.status(503).json({
-        ok: false,
-        error: "LANGGRAPH_RUNTIME_URL_REQUIRED",
-        message: "LangGraph has been removed from GCF. Configure LANGGRAPH_RUNTIME_URL to a hosted LangGraph runtime endpoint."
-      });
-      return;
-    }
-
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
     const trace = [step("system", "middleware_received", { agent_id: agentId || null, okf_key: okfKey, thread_id: threadId, agent_memory_id: agentMemoryId })];
 
     try {
       const okfEnvelope = await readCrudxEnvelope(okfKey);
       trace.push(step("crudx", "okf_loaded", { okf_key: okfKey }));
+
+      if (isHelpRequest(input)) {
+        const help = buildCamHelp(okfEnvelope, okfKey, agentId);
+        trace.push(step("system", "cam_help_completed", { okf_key: okfKey, example_count: help.examples.length }));
+        res.status(200).json({
+          ok: true,
+          run_key: null,
+          thread_id: threadId,
+          agent_memory_id: agentMemoryId,
+          okf_key: okfKey,
+          agent_id: unwrapOkfAgent(okfEnvelope, okfKey).agent_id || agentId || null,
+          answer: help.answer,
+          response_format: "markdown",
+          graph: null,
+          langsmith: null,
+          trace,
+          runtime: {
+            middleware: "gcf-react-aaas",
+            graph_runtime: "bypassed",
+            route: "cam-help",
+            side_effect_free: true
+          }
+        });
+        return;
+      }
+
+      if (!runtimeUrl) {
+        res.status(503).json({
+          ok: false,
+          error: "LANGGRAPH_RUNTIME_URL_REQUIRED",
+          message: "LangGraph has been removed from GCF. Configure LANGGRAPH_RUNTIME_URL to a hosted LangGraph runtime endpoint."
+        });
+        return;
+      }
 
       const graphResult = await invokeExternalLangGraphRuntime(runtimeUrl, {
         run_key: runKey,
@@ -263,11 +289,6 @@ exports.reactAaasStream = onRequest(
       res.status(400).json({ ok: false, error: "VALID_OKF_CRUDX_KEY_REQUIRED" });
       return;
     }
-    if (!runtimeUrl) {
-      res.status(503).json({ ok: false, error: "LANGGRAPH_RUNTIME_URL_REQUIRED" });
-      return;
-    }
-
     writeSseHeaders(res);
     const runKey = stableCrudxKey("react-aaas-run", `${okfKey}:${input}:${Date.now()}`);
     const middlewareTrace = [
@@ -280,6 +301,43 @@ exports.reactAaasStream = onRequest(
       const okfLoaded = step("crudx", "okf_loaded", { okf_key: okfKey });
       middlewareTrace.push(okfLoaded);
       writeSseEvent(res, "trace", okfLoaded);
+
+      if (isHelpRequest(input)) {
+        const help = buildCamHelp(okfEnvelope, okfKey, agentId);
+        const completed = step("system", "cam_help_completed", { okf_key: okfKey, example_count: help.examples.length });
+        middlewareTrace.push(completed);
+        writeSseEvent(res, "trace", completed);
+        writeSseEvent(res, "result", {
+          ok: true,
+          run_key: null,
+          thread_id: threadId,
+          agent_memory_id: agentMemoryId,
+          okf_key: okfKey,
+          agent_id: unwrapOkfAgent(okfEnvelope, okfKey).agent_id || agentId || null,
+          answer: help.answer,
+          response_format: "markdown",
+          graph: null,
+          langsmith: null,
+          trace: middlewareTrace,
+          runtime: {
+            middleware: "gcf-react-aaas-stream",
+            graph_runtime: "bypassed",
+            route: "cam-help",
+            side_effect_free: true
+          }
+        });
+        writeSseEvent(res, "gcf_completed", {
+          ok: true,
+          run_key: null,
+          thread_id: threadId,
+          agent_memory_id: agentMemoryId,
+          okf_key: okfKey,
+          route: "cam-help"
+        });
+        return;
+      }
+
+      if (!runtimeUrl) throw new Error("LANGGRAPH_RUNTIME_URL_REQUIRED");
 
       const graphResult = await streamStandaloneLangGraphRuntime(runtimeUrl, {
         run_key: runKey,
